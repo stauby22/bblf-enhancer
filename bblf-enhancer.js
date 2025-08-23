@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BBLF Enhancer
 // @namespace    http://tampermonkey.net/
-// @version      1.34
+// @version      1.35
 // @description  Monitor for issues on the live feed page, reloading or starting video when necessary. Can autoload quad cam, add hotkeys, show video scrubber, and remap fullscreen button to only show video.
 // @author       liquid8d
 // @match        https://www.paramountplus.com/shows/big_brother/live_feed/stream/
@@ -10,6 +10,8 @@
 
 // ==/UserScript==
 /*
+v 1.35 (2025)
+ - add quality switch delay to prevent 2103 error
 v 1.34 (2025)
  - fix audio pan to split channels properly
  - hookwebaudio only to primary video in case it interferes with thumbs (thumbs have no audio anyways)
@@ -131,14 +133,19 @@ v 1.2
         const video = document.querySelectorAll('video')[1]
         const player = video.player
         const playback = video.player.getAdapter('playback')
-		if (player && playback && player.qualityCategory != preferredQuality || !qualityFixed) {
-			playback.maxHeight = 1080
-			playback.maxBitrate = 5000000
-			playback.refreshQualities()
-			player.qualityCategory = preferredQuality
-			qualityFixed = true
-		}
-        audioCtx.resume();
+        if (player && playback) {
+            if (player.qualityCategory != preferredQuality) {
+                playback.maxHeight = 1080
+                playback.maxBitrate = 5000000
+                playback.refreshQualities()
+            } else if (!qualityFixed) {
+                qualityFixed = true
+                setTimeout(() => {
+                    player.qualityCategory = preferredQuality
+                    audioCtx.resume();
+                }, 3000)
+            }
+        }
     }
 
     function checkVideo() {
