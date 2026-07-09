@@ -7,14 +7,11 @@ A collection of random browser scripts to enhance various websites.
 This is a tampermonkey script that will improve the experience on the Big Brother Live Feeds page.
 
 ## Features
-* Auto-click the 'Click to watch' buttons when changing cameras
-* Auto-switch to Quad cam at startup
 * Add number hotkeys for switching cameras (1-5)
-* Makes the fullscreen button fullscreen just the camera, and not the page
-* Hide chat and video thumbs
 * Watch for video error messages and reload page
 * Extended Watch: Watch for 'Still watching' or 'Timeout' messages and click or reload page
 * Hides P+ controls and show video scrubber
+* Auto-switch to Quad cam at startup (optional)
 
 Any of these features are optional by changing the settings in the script.
 
@@ -32,9 +29,9 @@ Any of these features are optional by changing the settings in the script.
 
 3. Click the Install button, then Install again.
 
-4. With the script installed, visit the Live Feeds page, click the Tampermonkey button in your extensions bar (usually the top-right of the browser, accessed by clicking the puzzle piece icon) and toggle the BBLF Enhancer on.
+4. With the script installed, visit the [Big Brother](https://www.paramountplus.com/shows/big_brother/) P+ page, and select a Live Feed camera.
 
-5. Refresh the page. You must click the Start BBLF Enhancer button to begin using these features.
+5. With the video loaded, ensure the script is enabled by clicking the Tampermonkey button in your extensions bar (usually the top-right of the browser, accessed by clicking the puzzle piece icon) and look for BBLF Enhancer on. Toggle it on if it is not already.
 
 To disable the script at any time, toggle BBLF Enhancer script off in Tampermonkey, and refresh the page.
 

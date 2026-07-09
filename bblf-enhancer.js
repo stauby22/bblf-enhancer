@@ -1,17 +1,18 @@
 // ==UserScript==
 // @name         BBLF Enhancer
 // @namespace    http://tampermonkey.net/
-// @version      1.35
+// @version      1.4
 // @description  Monitor for issues on the live feed page, reloading or starting video when necessary. Can autoload quad cam, add hotkeys, show video scrubber, and remap fullscreen button to only show video.
 // @author       liquid8d
+// @match        https://www.paramountplus.com/live-tv/stream/big_brother/*
 // @match        https://www.paramountplus.com/shows/big_brother/live_feed/stream/
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=paramountplus.com
 // @grant        GM_log
 
 // ==/UserScript==
 /*
-v 1.35 (2025)
- - add quality switch delay to prevent 2103 error
+v 1.4 (2026)
+ - match live tv streams
 v 1.34 (2025)
  - fix audio pan to split channels properly
  - hookwebaudio only to primary video in case it interferes with thumbs (thumbs have no audio anyways)
@@ -32,6 +33,14 @@ v 1.2
 (function() {
     'use strict';
 
+    const LIVETV_CAMS = [
+        'https://www.paramountplus.com/live-tv/stream/big_brother/410a1e4b-a190-4964-9d66-0432ccbe36c2/',
+        'https://www.paramountplus.com/live-tv/stream/big_brother/39d39a39-184b-441c-abb6-62ea5e1e5adc/',
+        'https://www.paramountplus.com/live-tv/stream/big_brother/81c3ed2c-f639-406e-990d-a121fa14d4b3/',
+        'https://www.paramountplus.com/live-tv/stream/big_brother/6679e2a1-f9de-464f-ac1d-9cc9dc31e27d/',
+        'https://www.paramountplus.com/live-tv/stream/big_brother/524e313f-9fb2-484a-bb7a-e83b9d51d2f0/'
+    ]
+
     const hotkeys = [
         { key: 1, action: function() { switchCam(1) } },
         { key: 2, action: function() { switchCam(2) } },
@@ -44,14 +53,14 @@ v 1.2
     ]
 
     // force allow up to 1080p resolution
-    const qualityFix = true
+    const qualityFix = false
     const preferredQuality = '1080p' // one of 1080p, 720p, 540p, 360p, 288p, 216p
     // force switch to quad cam on page load
-    const autoQuadCam = true
+    const autoQuadCam = false
     // remove P+ video controls and show built-in video controls allowing scrubbing
-    const removeControls = true
+    const removeControls = false
     // hide chat and video thumbs on fullscreen
-    const fullscreenVideoOnly = true
+    const fullscreenVideoOnly = false
     // reload the page when an error is encountered
     const reloadOnError = true
     // keep watching if still watching is shown
@@ -91,8 +100,8 @@ v 1.2
     if (localStorage.getItem('bblf_video_monitor_attempts')) attempts = (resetScript) ? 0 : parseInt(localStorage.getItem('bblf_video_monitor_attempts'))
 
     // NOTE: you might try just running startup instead of injectStartButton, there is a freezeup for me
-    // startup()
-    injectStartButton()
+    startup()
+    // injectStartButton()
 
     function injectStartButton() {
         var startEl = document.createElement('input')
@@ -111,8 +120,8 @@ v 1.2
         log('starting bblf enhancer')
 
         // remove start button
-        const startEl = document.getElementById('bblf-enhance')
-        if (startEl) startEl.parentNode.removeChild(startEl)
+        // const startEl = document.getElementById('bblf-enhance')
+        // if (startEl) startEl.parentNode.removeChild(startEl)
 
         // enable hotkeys
         if (enableHotkeys) {
@@ -122,7 +131,9 @@ v 1.2
                     if (e.key === hotkey || e.code === hotkey) hotkeys[i].action()
                 }
             }
+            log('hotkeys enabled')
         }
+
         // start watching video
         setInterval(() => {
             checkVideo();
@@ -133,22 +144,18 @@ v 1.2
         const video = document.querySelectorAll('video')[1]
         const player = video.player
         const playback = video.player.getAdapter('playback')
-        if (player && playback) {
-            if (player.qualityCategory != preferredQuality) {
-                playback.maxHeight = 1080
-                playback.maxBitrate = 5000000
-                playback.refreshQualities()
-            } else if (!qualityFixed) {
-                qualityFixed = true
-                setTimeout(() => {
-                    player.qualityCategory = preferredQuality
-                    audioCtx.resume();
-                }, 3000)
-            }
-        }
+		if (player && playback && player.qualityCategory != preferredQuality || !qualityFixed) {
+			playback.maxHeight = 1080
+			playback.maxBitrate = 5000000
+			playback.refreshQualities()
+			player.qualityCategory = preferredQuality
+			qualityFixed = true
+		}
+        audioCtx.resume();
     }
 
     function checkVideo() {
+        /*
         if (fullscreenVideoOnly && !fsButtonMapped) {
             log('remapping fullscreen button')
             // remaps the fullscreen button to only fullscreen video skin
@@ -167,6 +174,7 @@ v 1.2
                 warn('can not remap fullscreen button, missing element')
             }
         }
+        */
 
         if (extendedWatch) {
             const countdownButton = document.querySelector('.stream-countdown-button')
@@ -252,14 +260,8 @@ v 1.2
     }
 
     function switchCam(num) {
-        if (document.activeElement) document.activeElement.blur()
-        const el = document.querySelector('.multi-cam-plugin-thumb-player-container .index-item[data-camid="' + num + '"]')
-        if (el) {
-            el.click()
-            qualityFixed = false
-        } else {
-            warn('could not find camera element ' + num + ', unable to change')
-        }
+        const url = LIVETV_CAMS[num - 1]
+        window.open(url, '_self')
     }
 
     function addNode(node) {
