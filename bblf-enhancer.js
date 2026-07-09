@@ -2,17 +2,21 @@
 // @name         BBLF Enhancer
 // @namespace    http://tampermonkey.net/
 // @version      1.4
-// @description  Monitor for issues on the live feed page, reloading or starting video when necessary. Can autoload quad cam, add hotkeys, show video scrubber, and remap fullscreen button to only show video.
+// @description  Monitor for issues on Big Brother Live Feed streams, reloading or starting video when necessary. Can autoload quad cam, add hotkeys, show video scrubber, and remap fullscreen button to only show video.
 // @author       liquid8d
 // @match        https://www.paramountplus.com/live-tv/stream/big_brother/*
-// @match        https://www.paramountplus.com/shows/big_brother/live_feed/stream/
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=paramountplus.com
 // @grant        GM_log
 
 // ==/UserScript==
 /*
 v 1.4 (2026)
- - match live tv streams
+ - no more live feed page, so removed those fixes
+ - match live tv streams (live-tv/stream/big_brother/*)
+ - quality fix changes (must specify preferredQuality as stream index)
+	- qualityFixAttempts was added to avoid situations where quality fix isn't working
+v 1.35 (2025)
+ - add quality switch delay to prevent 2103 error
 v 1.34 (2025)
  - fix audio pan to split channels properly
  - hookwebaudio only to primary video in case it interferes with thumbs (thumbs have no audio anyways)
@@ -53,8 +57,11 @@ v 1.2
     ]
 
     // force allow up to 1080p resolution
-    const qualityFix = false
-    const preferredQuality = '1080p' // one of 1080p, 720p, 540p, 360p, 288p, 216p
+    const qualityFix = true
+	// 0 = 270p, 1 = 360p, 2 = 540p
+	// 3 = 720p, 4 = 1080p (low bitrate), 5 = 1080p (high bitrate)
+    const preferredQuality = 4
+	const qualityFixAttempts = 5
     // force switch to quad cam on page load
     const autoQuadCam = false
     // remove P+ video controls and show built-in video controls allowing scrubbing
@@ -81,15 +88,15 @@ v 1.2
     // DO NOT MODIFY AFTER HERE
 
     // current camera (only modified to verify quad cam switch)
-    var camNum = 1
+    var camNum = getCamera()
     // current attempts, will fail after retryMaxAttemps reached
     var attempts = 0
-    // whether the fullscreen button has been remapped
-    var fsButtonMapped = false
     // whether the P+ player controls have been removed
     var controlsRemoved = false
     // whether quality fix has been added
     var qualityFixed = false
+	// count attempts at quality fix
+	var qualityAttempts = 0
 
     // audio control variables
     const audioCtx = new (window.AudioContext)();
@@ -99,29 +106,16 @@ v 1.2
 
     if (localStorage.getItem('bblf_video_monitor_attempts')) attempts = (resetScript) ? 0 : parseInt(localStorage.getItem('bblf_video_monitor_attempts'))
 
-    // NOTE: you might try just running startup instead of injectStartButton, there is a freezeup for me
     startup()
-    // injectStartButton()
 
-    function injectStartButton() {
-        var startEl = document.createElement('input')
-        startEl.id = 'bblf-enhance'
-        startEl.type = 'button'
-        startEl.value = 'Start BBLF Enhancer'
-        startEl.style = 'position: relative; left: calc(50% - 80px); width: 160px; height: 48px; z-index: 99999; cursor: pointer;'
-        startEl.addEventListener('click', startup)
-        var mcplayerEl = document.getElementById('mcplayer')
-        mcplayerEl.parentNode.insertBefore(startEl, mcplayerEl.nextSibling)
-        mcplayerEl.appendChild(startEl)
-        log('waiting for user to click start button')
-    }
-
-    function startup() {
+	function startup() {
         log('starting bblf enhancer')
+		log('starting on camera ' + camNum)
 
-        // remove start button
-        // const startEl = document.getElementById('bblf-enhance')
-        // if (startEl) startEl.parentNode.removeChild(startEl)
+		if (autoQuadCam && camNum != 5) {
+			log('switching to quad cam')
+			switchCam(5)
+		}
 
         // enable hotkeys
         if (enableHotkeys) {
@@ -140,42 +134,37 @@ v 1.2
         }, monitorInterval);
     }
 
-    function updateQualities() {
-        const video = document.querySelectorAll('video')[1]
-        const player = video.player
-        const playback = video.player.getAdapter('playback')
-		if (player && playback && player.qualityCategory != preferredQuality || !qualityFixed) {
-			playback.maxHeight = 1080
-			playback.maxBitrate = 5000000
-			playback.refreshQualities()
-			player.qualityCategory = preferredQuality
-			qualityFixed = true
+	function getCamera() {
+		for (var i = 0; i < LIVETV_CAMS.length; i++) {
+			if (window.location.href == LIVETV_CAMS[i]) return i + 1
 		}
-        audioCtx.resume();
+	}
+
+    function updateQualities() {
+		const video = document.querySelector('video')
+        const player = video.player
+		const playback = video.player.getAdapter('playback')
+		if (player && playback && (player.bitrate != playback.qualities[preferredQuality].bitrate || !qualityFixed)) {
+			if (qualityAttempts < qualityFixAttempts) {
+				log('applying quality fix...')
+				qualityAttempts += 1
+				playback.maxBitrate = 8128372
+				playback.maxHeight = 1080
+				video.player.maxBitrate = 8128372
+				video.player.autoQualitySwitching = false
+				playback.qualities = video.player.qualities
+				setTimeout(() => {
+					video.player.bitrate = playback.qualities[preferredQuality].bitrate
+					audioCtx.resume();
+					qualityFixed = true
+				}, 3000)
+			} else {
+				log('quality fix attempts maxed, quality fix not working for some reason.')
+			}
+		}
     }
 
     function checkVideo() {
-        /*
-        if (fullscreenVideoOnly && !fsButtonMapped) {
-            log('remapping fullscreen button')
-            // remaps the fullscreen button to only fullscreen video skin
-            const el = document.querySelector('button.btn-fullscreen')
-            if (el) {
-                el.onclick = function() {
-                    if (document.fullscreenElement) {
-                        document.exitFullscreen()
-                    } else {
-                        const player = document.querySelector('.aa-player-skin')
-                        player.requestFullscreen()
-                    }
-                }
-                fsButtonMapped = true
-            } else {
-                warn('can not remap fullscreen button, missing element')
-            }
-        }
-        */
-
         if (extendedWatch) {
             const countdownButton = document.querySelector('.stream-countdown-button')
             if (countdownButton) {
@@ -208,9 +197,9 @@ v 1.2
         } else {
             var startPanelEl = document.querySelector('.start-panel.show')
             if (startPanelEl) {
-                warn('start panel is showing, click to start video.')
+                warn('start panel is showing, trying to click to start video (manual user intervention may be required)')
                 var clickEl = document.querySelector('.start-panel-click-overlay')
-                clickEl.click()
+                if (clickEl) clickEl.click()
             } else {
                 var videoEl = document.querySelector('.aa-player-skin .player-wrapper video')
                 if (videoEl) {
@@ -220,7 +209,7 @@ v 1.2
                             // attempt to unpause video
                             info('video is available and paused, trying to force play (manual user intervention may be required)')
                             const el = document.getElementById('mcplayer')
-                            el.click()
+                            if (el) el.click()
                             attempts += 1
                             localStorage.setItem('bblf_video_monitor_attempts', attempts)
                         } else {
@@ -228,26 +217,20 @@ v 1.2
                             info('video is available and paused, "forcePlay" is not enabled')
                         }
                     } else {
-                        if (autoQuadCam && camNum == 1) {
-                            log('switching to quad cam')
-                            switchCam(5)
-                            camNum = 5
-                        } else {
-                            log('video is ready and playing.')
-                            if (qualityFix) updateQualities()
-                            if (removeControls && !controlsRemoved) {
-                                log('removing P+ controls')
-                                controlsRemoved = true
-                                // remove the player elements
-                                const playerEls = ['.controls-backplane', '.controls-manager', '.top-menu-backplane']
-                                for (var i = 0; i < playerEls.length; i++) {
-                                    var el = document.querySelector(playerEls[i])
-                                    el.parentNode.removeChild(el)
-                                }
-                                // enable built-in video controls allowing scrubbing
-                            }
-                            if (controlsRemoved) videoEl.controls = true
-                        }
+						log('video is ready and playing.')
+						if (qualityFix) updateQualities()
+						if (removeControls && !controlsRemoved) {
+							log('removing P+ controls')
+							controlsRemoved = true
+							// remove the player elements
+							const playerEls = ['.controls-backplane', '.controls-manager', '.top-menu-backplane']
+							for (var i = 0; i < playerEls.length; i++) {
+								var el = document.querySelector(playerEls[i])
+								el.parentNode.removeChild(el)
+							}
+							// enable built-in video controls allowing scrubbing
+						}
+						if (controlsRemoved) videoEl.controls = true
                     }
                     attempts = 0
                     localStorage.setItem('bblf_video_monitor_attempts', 0)
