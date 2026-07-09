@@ -1,82 +1,32 @@
-/* BBLF Enhancer CSS v2 (2025) */
+/* BBLF Enhancer CSS v3 (2026) */
+/*
+ - There is no more live feed "page", so we only care about big_brother live-tv pages now
+ - This CSS is intended for the Stylebot extension (https://chromewebstore.google.com/detail/stylebot/oiaejidbmkiecgbjeifoejpgmdaleoha)
+ - It should be applied to the following url:
+	https://www.paramountplus.com/live-tv/stream/big_brother/*
+ - It will hide header/footer and the live tv menu, showing only the video
+ - To change cameras with this enabled, you can do one of the following:
+	* Click the Stylebot extension icon to disable the CSS and use the Live TV menu
+	* Visit the Big Brother page (https://www.paramountplus.com/shows/big_brother/) and use the Live Feed thumbnails
+	* Bookmark each camera url and change that way
+*/
 
-/* you can uncomment display:none to hide cam switcher */
-.skin-multi-cam-plugin {
-  /* display: none; */
-}
-
-/* you can comment display:none to show sidebar/chat */
-.skin-multi-cam-plugin-sub-sections-elements {
-  display: none;
-}
-
-/* you can uncomment left: -100% to hide the loading spinner */
-.multi-cam-plugin-loading-animation-shift {
-  margin-left: calc(12%);
-  margin-bottom: calc(8%);
-  /* left: -100%; */
-}
-
-/* you can uncomment display:none to hide video overlay controls */
-.metadata-manager, .skin-metadata-manager-content, .rating-manager, .product-placement-manager, .controls-backplane, .skip-button-wrapper, .controls-brand-logo-wrapper, .controls-manager, .gate-manager, .ad-info-manager, .tool-tip-manager, .modal-manager, .top-menu-backplane, .top-menu-manager {
-  /* display: none; */
-}
-
-/* don't change anything else, unless you know what you are doing */
-
-/* hide disclaimer */
-.disclaimer {
-  display: none !important;
-}
-
-/* .live-timeout-manager {} */
-
-[data-role="adContainer"], [data-role="adClickEl"] {
-  display: none;
-}
-
-/* various format page */
-
-/* fill the page */
-html, body {
-  margin-top: 0;
-  min-height: unset;
-  height: 100%;
-}
-
-/* remove P+ header and footer */
 header, footer {
   display: none;
 }
 
-/* force main and player to take up whole page */
-main {
-  display: block;
-  position: absolute;
-  top: 0;
-  left: 0;
-  min-height: unset;
-  width: 100%;
-  height: 100%;
-  box-sizing: border-box;
+.video__metadata {
+  display: none;
 }
 
-#mcplayer {
-  position: relative;
-  min-width: unset;
-  min-height: unset;
-  margin: 0;
-  width: 100%;
-  height: 100%;
-  box-sizing: border-box;
+div[data-role="videoContainer"] {
+  z-index: 9999 !important;
 }
 
-.player-services-smart-tag-content-element {
-  display: flex;
-  flex-direction: column;
-}
+/* CONTROLS
+comment out .controls-manager css if you don't want controls ontop (mute, fullscreen, live tag)
+*/
 
-.aa-player-skin.multi-cam-plugin-skin-shift {
-  width: 100%;
-  height: 100%;
+.controls-manager {
+  z-index: 100000 !important;
 }

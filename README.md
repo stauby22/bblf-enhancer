@@ -40,36 +40,46 @@ To disable the script at any time, toggle BBLF Enhancer script off in Tampermonk
 
 # Stylebot CSS (bblf-enhancer.css)
 
-This is some custom CSS that cleans up the Big Brother Live feeds page (which is absolutely awful btw).
+This is some custom CSS to clean up the Live TV interface on Paramount+ when watching Big Brother Live Feeds.
 
-** Warning: this will modify the display of the Paramount+ Live Feeds page temporarily, and may cause issues navigating or using the page. You can disable it in Stylebot by toggling it off to return to normal. A page refresh may be required. **
+** Warning: this will modify the display of the Paramount+ Live TV, and may cause issues navigating or using the page. You can disable it in Stylebot by toggling it off to return to normal. A page refresh may be required. **
 
 ## Features
-* Adjust page to hide header/footer and make video fill the page
-* (optional) hide the thumbs cam to have just the active camera video
-* (optional) hide the sidebar/chat
-* (optional) hide the loading spinner
-* (optional) hide P+ video overlay and controls
+* Removes the header/footer to make video fill the page
+* Removes the Live TV menu
+* (optional) hide the video controls
 
 ## Install instructions:
 
 1. Install the [Stylebot extension](https://chromewebstore.google.com/detail/stylebot/oiaejidbmkiecgbjeifoejpgmdaleoha) in your browser.
 
-2. Go to the Live Feeds page.
+2. Click the Stylebot icon in your browser extensions bar (usually the top-right of the browser, accessed by clicking the puzzle piece icon - you can pin Stylebot for easier access), then click Options
 
-3. Click the Stylebot icon in your browser extensions bar (usually the top-right of the browser, accessed by clicking the puzzle piece icon)
+3. Go to Styles, Add a new style...
 
-4. Click Open Stylebot
+4. In Enter URL... box, type:
 
-5. Click the Code button at the bottom and paste the css provided here:
+    `https://www.paramountplus.com/live-tv/stream/big_brother/*`
+
+5. In the code box, copy and paste the css provided here:
 
     `https://raw.githubusercontent.com/liquid8d/browser-scripts/refs/heads/main/bblf-enhancer.css`
 
-6. Click the X (close) button
+6. Click the Save button.
 
-7. Make sure the CSS is enabled for the page by clicking the Stylebot extension icon again and toggle the css for the live feeds page to on.
+7. If you don't even want the controls to display, comment the controls-manager css.
 
-If you open Stylebot again, you can modify the css to adjust things how you want them. Comments explain what can be modified.
+## Post Install
+Go to the Big Brother page and pick a Live Feed camera: 
 
+`https://www.paramountplus.com/shows/big_brother/`
+
+If the css is applied correctly, you should now only see video on the live tv channels for Big Brother, and menus and overlays will be hidden.
+
+**This CSS hides the Live TV menu, how do I switch cameras?!**
+
+* Click the Stylebot extension icon to disable the CSS
+* Access the Live Feed thumbnails on the Big Brother page
+* Bookmark each camera url directly and change that way
 
 
