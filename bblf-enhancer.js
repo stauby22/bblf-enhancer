@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BBLF Enhancer
 // @namespace    http://tampermonkey.net/
-// @version      1.5
+// @version      1.5.1
 // @description  Monitor for issues on Big Brother Live Feed streams, reloading or starting video when necessary. Can autoload quad cam, add hotkeys, show video scrubber, and remap fullscreen button to only show video.
 // @author       liquid8d
 // @match        https://www.paramountplus.com/live-tv/stream/big_brother/*
@@ -10,6 +10,11 @@
 
 // ==/UserScript==
 /*
+v 1.5.1 (2026)
+ - hideGuideOverlay: hide the Live TV channel guide that pops up when hovering the left side of the video
+   (previously required the companion Stylebot CSS; injected by the script now)
+ - theaterMode: optionally inject the rest of the Stylebot CSS (hide header/footer/metadata)
+ - audio bar now anchors inside the player instead of the viewport (no header collision, visible in fullscreen)
 v 1.5 (2026)
  - quality fix now sets player qualityCategory + refreshQualities (ported from BBViewer extension inject.js)
    - old method still available via useLegacyQualityFix
@@ -87,6 +92,11 @@ v 1.2
     const extendedWatch = true
     // enable hotkeys
     const enableHotkeys = true
+    // hide the Live TV channel guide overlay (pops up when hovering the left side of the video)
+    // note: with this on, use the 1-5 hotkeys or bookmarks to change cameras
+    const hideGuideOverlay = true
+    // hide P+ page chrome too (header, footer, video metadata) - same as the Stylebot CSS
+    const theaterMode = false
     // show floating audio bar (pan + gain boost) over the video
     const showAudioControls = true
     // max gain boost multiplier (1 = no boost, boosting too high will distort/clip)
@@ -133,6 +143,8 @@ v 1.2
 	function startup() {
         log('starting bblf enhancer')
 		log('starting on camera ' + camNum)
+
+		ensureStyles()
 
 		if (autoQuadCam && camNum != 5) {
 			log('switching to quad cam')
@@ -267,6 +279,7 @@ v 1.2
                     } else {
 						log('video is ready and playing.')
 						if (audioCtx.state === 'suspended') audioCtx.resume()
+						ensureStyles()
 						if (showAudioControls) ensureAudioBar()
 						if (enableFullscreenHotkey && !fsDefused) defuseSmartTagFullscreen()
 						if (qualityFix) updateQualities()
@@ -371,6 +384,23 @@ v 1.2
         });
     }
 
+    function ensureStyles() {
+        if (document.getElementById('bblf-styles')) return
+        var css = ''
+        // from the companion Stylebot CSS (bblf-enhancer.css)
+        if (hideGuideOverlay) css += 'div.skin-sidebar-plugin { display: none !important; }\n'
+        if (theaterMode) css += [
+            '.header__nav', '#user-profiles-menu-trigger', '#kids-access-button', 'footer',
+            '.video__metadata', 'div.top-menu-hint', '.top-menu-backplane', '.controls-backplane'
+        ].join(', ') + ' { display: none !important; }\n'
+        if (!css) return
+        const style = document.createElement('style')
+        style.id = 'bblf-styles'
+        style.textContent = css
+        document.head.appendChild(style)
+        log('styles injected')
+    }
+
     function toggleFullscreen() {
         if (document.fullscreenElement) {
             document.exitFullscreen()
@@ -406,9 +436,13 @@ v 1.2
 
     function ensureAudioBar() {
         if (document.getElementById('bblf-audio-bar')) return
+        // anchor inside the player skin so the bar sits over the video (and shows in fullscreen), not the page header
+        const skin = document.querySelector('.aa-player-skin')
+        if (!skin) return
+        if (getComputedStyle(skin).position === 'static') skin.style.position = 'relative'
         const bar = document.createElement('div')
         bar.id = 'bblf-audio-bar'
-        bar.style.cssText = 'position:fixed;top:10px;left:50%;transform:translateX(-50%);z-index:2147483647;' +
+        bar.style.cssText = 'position:absolute;top:10px;left:50%;transform:translateX(-50%);z-index:2147483647;' +
             'display:flex;gap:6px;align-items:center;background:rgba(20,20,20,0.75);padding:4px 10px;' +
             'border-radius:6px;font:12px/1.4 sans-serif;color:#eee;'
         const pans = [ { pan: 'left', label: 'L' }, { pan: 'none', label: 'Center' }, { pan: 'right', label: 'R' } ]
@@ -438,7 +472,7 @@ v 1.2
         gainLabel.id = 'bblf-gain-label'
         gainLabel.textContent = gainBoost.toFixed(2) + 'x'
         bar.appendChild(gainLabel)
-        document.body.appendChild(bar)
+        skin.appendChild(bar)
         updatePanUI()
         log('audio bar added')
     }
