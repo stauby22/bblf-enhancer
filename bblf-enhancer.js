@@ -1,15 +1,23 @@
 // ==UserScript==
 // @name         BBLF Enhancer
 // @namespace    http://tampermonkey.net/
-// @version      1.5.3
+// @version      1.6
 // @description  Monitor for issues on Big Brother Live Feed streams, reloading or starting video when necessary. Can autoload quad cam, add hotkeys, show video scrubber, and remap fullscreen button to only show video.
 // @author       liquid8d
 // @match        https://www.paramountplus.com/live-tv/stream/big_brother/*
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=paramountplus.com
 // @grant        GM_log
+// @grant        GM_xmlhttpRequest
+// @connect      reddit.com
+// @connect      www.reddit.com
 
 // ==/UserScript==
 /*
+v 1.6 (2026)
+ - sidebar panel ('r' to toggle) with a live r/BigBrother Feed Discussion reader
+   - auto-finds the current "Feed Discussion" thread (morning/afternoon/evening/late night)
+   - polls new comments every 45s, newest first, keeps your scroll position, "N new" pill
+   - needs GM_xmlhttpRequest + @connect reddit.com (bypasses CORS, uses your reddit login)
 v 1.5.3 (2026)
  - only hide the channel list (.channels-container), not all of .live-schedule, so the player top bar survives
 v 1.5.2 (2026)
@@ -71,7 +79,8 @@ v 1.2
         { key: 'e', action: function() { adjustChannel('right') } },
         { key: 'f', action: function() { toggleFullscreen() } },
         { key: '[', action: function() { setGainBoost(gainBoost - 0.25) } },
-        { key: ']', action: function() { setGainBoost(gainBoost + 0.25) } }
+        { key: ']', action: function() { setGainBoost(gainBoost + 0.25) } },
+        { key: 'r', action: function() { togglePanel() } }
     ]
 
     // force allow up to 1080p resolution
@@ -107,6 +116,19 @@ v 1.2
     const maxGainBoost = 3
     // enable 'f' hotkey to fullscreen only the video (disables the P+ built-in fullscreen handler)
     const enableFullscreenHotkey = true
+    // enable the sidebar panel ('r' to toggle) with the reddit feed discussion reader
+    const enablePanel = true
+    // subreddit + link flair of the live feed discussion threads
+    const redditSub = 'BigBrother'
+    const redditFlair = 'Feed Discussion'
+    // how often to poll for new comments while the panel is open (secs * ms)
+    const redditCommentInterval = 45 * 1000
+    // how often to re-check which discussion thread is current (secs * ms)
+    const redditThreadInterval = 10 * 60 * 1000
+    // how many comments to fetch per poll
+    const redditCommentLimit = 75
+    // panel width in px
+    const panelWidth = 360
     // autostart video when page is loaded
     const forcePlay = true
     // delay before reloading the page on an error (secs * ms)
@@ -139,6 +161,14 @@ v 1.2
     let gainBoost = 1;
     let currentPan = 'none';
     let fsDefused = false;
+
+    // panel / reddit state
+    let panelOpen = localStorage.getItem('bblf_panel_open') === '1';
+    let redditThread = null;
+    let redditSeen = {};
+    let redditTimer = null;
+    let redditLastDiscover = 0;
+    let redditPillCount = 0;
 
     if (localStorage.getItem('bblf_video_monitor_attempts')) attempts = (resetScript) ? 0 : parseInt(localStorage.getItem('bblf_video_monitor_attempts'))
 
@@ -285,6 +315,7 @@ v 1.2
 						if (audioCtx.state === 'suspended') audioCtx.resume()
 						ensureStyles()
 						if (showAudioControls) ensureAudioBar()
+						if (enablePanel) ensurePanel()
 						if (enableFullscreenHotkey && !fsDefused) defuseSmartTagFullscreen()
 						if (qualityFix) updateQualities()
 						if (removeControls && !controlsRemoved) {
@@ -481,6 +512,224 @@ v 1.2
         skin.appendChild(bar)
         updatePanUI()
         log('audio bar added')
+    }
+
+    // --- sidebar panel + reddit feed discussion reader ---
+
+    function ensurePanel() {
+        if (document.getElementById('bblf-panel')) return
+        const skin = document.querySelector('.aa-player-skin')
+        if (!skin) return
+        if (getComputedStyle(skin).position === 'static') skin.style.position = 'relative'
+
+        const panel = document.createElement('div')
+        panel.id = 'bblf-panel'
+        panel.style.cssText = 'position:absolute;top:0;right:0;bottom:0;width:' + panelWidth + 'px;z-index:2147483646;' +
+            'display:none;flex-direction:column;background:rgba(12,12,12,0.92);color:#eee;' +
+            'font:13px/1.45 sans-serif;border-left:1px solid #333;'
+
+        const header = document.createElement('div')
+        header.style.cssText = 'display:flex;align-items:center;gap:8px;padding:8px 10px;border-bottom:1px solid #333;'
+        const title = document.createElement('div')
+        title.id = 'bblf-panel-title'
+        title.textContent = 'r/' + redditSub
+        title.style.cssText = 'flex:1;font-weight:bold;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;'
+        const refreshBtn = document.createElement('button')
+        refreshBtn.textContent = '↻'
+        refreshBtn.title = 'refresh now'
+        refreshBtn.style.cssText = 'background:transparent;border:1px solid #666;border-radius:4px;color:#eee;padding:2px 8px;cursor:pointer;font:inherit;'
+        refreshBtn.onclick = function() { redditRefresh(true) }
+        const closeBtn = document.createElement('button')
+        closeBtn.textContent = '✕'
+        closeBtn.title = "close (or press 'r')"
+        closeBtn.style.cssText = refreshBtn.style.cssText
+        closeBtn.onclick = function() { togglePanel() }
+        header.appendChild(title)
+        header.appendChild(refreshBtn)
+        header.appendChild(closeBtn)
+
+        const status = document.createElement('div')
+        status.id = 'bblf-panel-status'
+        status.style.cssText = 'padding:4px 10px;color:#999;font-size:11px;border-bottom:1px solid #222;'
+        status.textContent = 'loading...'
+
+        const list = document.createElement('div')
+        list.id = 'bblf-reddit-list'
+        list.style.cssText = 'flex:1;overflow-y:auto;padding:6px 10px;overscroll-behavior:contain;'
+
+        const pill = document.createElement('button')
+        pill.id = 'bblf-reddit-pill'
+        pill.style.cssText = 'position:absolute;top:64px;left:50%;transform:translateX(-50%);z-index:1;display:none;' +
+            'background:#1fce6d;color:#111;border:none;border-radius:10px;padding:2px 10px;cursor:pointer;font:11px sans-serif;'
+        pill.onclick = function() {
+            list.scrollTop = 0
+            redditPillCount = 0
+            pill.style.display = 'none'
+        }
+
+        panel.appendChild(header)
+        panel.appendChild(status)
+        panel.appendChild(list)
+        panel.appendChild(pill)
+        skin.appendChild(panel)
+        applyPanel()
+        log('panel added')
+    }
+
+    function togglePanel() {
+        if (!enablePanel) return
+        panelOpen = !panelOpen
+        localStorage.setItem('bblf_panel_open', panelOpen ? '1' : '0')
+        applyPanel()
+    }
+
+    function applyPanel() {
+        const panel = document.getElementById('bblf-panel')
+        if (!panel) return
+        panel.style.display = panelOpen ? 'flex' : 'none'
+        if (panelOpen) redditStart()
+        else redditStop()
+    }
+
+    function redditStart() {
+        if (redditTimer) return
+        redditRefresh(false)
+        redditTimer = setInterval(function() { redditRefresh(false) }, redditCommentInterval)
+    }
+
+    function redditStop() {
+        if (redditTimer) {
+            clearInterval(redditTimer)
+            redditTimer = null
+        }
+    }
+
+    function gmFetchJson(url) {
+        return new Promise(function(resolve, reject) {
+            if (typeof GM_xmlhttpRequest === 'undefined') {
+                reject(new Error('GM_xmlhttpRequest unavailable - check the @grant lines'))
+                return
+            }
+            GM_xmlhttpRequest({
+                method: 'GET',
+                url: url,
+                headers: { 'Accept': 'application/json' },
+                timeout: 15000,
+                onload: function(r) {
+                    if (r.status >= 200 && r.status < 300) {
+                        try { resolve(JSON.parse(r.responseText)) }
+                        catch (e) { reject(new Error('reddit sent something that is not json (logged out or blocked?)')) }
+                    } else {
+                        reject(new Error('reddit http ' + r.status))
+                    }
+                },
+                onerror: function() { reject(new Error('reddit request failed')) },
+                ontimeout: function() { reject(new Error('reddit request timed out')) }
+            })
+        })
+    }
+
+    async function redditRefresh(force) {
+        try {
+            setPanelStatus('updating...')
+            if (force || !redditThread || (Date.now() - redditLastDiscover) > redditThreadInterval) {
+                await redditDiscover()
+                redditLastDiscover = Date.now()
+            }
+            await redditFetchComments()
+            setPanelStatus('updated ' + new Date().toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }))
+        } catch (e) {
+            setPanelStatus((e && e.message) ? e.message : String(e), true)
+        }
+    }
+
+    async function redditDiscover() {
+        const d = await gmFetchJson('https://www.reddit.com/r/' + redditSub + '/new.json?limit=25')
+        const posts = d.data.children.map(function(c) { return c.data })
+            .filter(function(p) { return p.link_flair_text === redditFlair })
+        if (!posts.length) throw new Error('no "' + redditFlair + '" thread found in r/' + redditSub)
+        posts.sort(function(a, b) { return b.created_utc - a.created_utc })
+        const t = posts[0]
+        if (!redditThread || redditThread.id !== t.id) {
+            redditThread = { id: t.id, title: t.title, permalink: t.permalink }
+            redditSeen = {}
+            redditPillCount = 0
+            const list = document.getElementById('bblf-reddit-list')
+            if (list) list.innerHTML = ''
+            const titleEl = document.getElementById('bblf-panel-title')
+            if (titleEl) {
+                titleEl.textContent = t.title
+                titleEl.title = t.title
+            }
+            log('reddit thread: ' + t.title)
+        }
+    }
+
+    async function redditFetchComments() {
+        if (!redditThread) return
+        const url = 'https://www.reddit.com' + redditThread.permalink.replace(/\/$/, '') +
+            '.json?sort=new&limit=' + redditCommentLimit
+        const d = await gmFetchJson(url)
+        const list = document.getElementById('bblf-reddit-list')
+        if (!list) return
+        var comments = d[1].data.children
+            .filter(function(c) { return c.kind === 't1' })
+            .map(function(c) { return c.data })
+            .filter(function(c) { return !c.stickied })
+        comments.sort(function(a, b) { return b.created_utc - a.created_utc })
+        const fresh = comments.filter(function(c) { return !redditSeen[c.id] })
+        if (!fresh.length) return
+        const atTop = list.scrollTop < 40
+        const heightBefore = list.scrollHeight
+        // prepend oldest-of-the-new first so the newest ends up on top
+        for (var i = fresh.length - 1; i >= 0; i--) {
+            redditSeen[fresh[i].id] = true
+            list.insertBefore(renderComment(fresh[i]), list.firstChild)
+        }
+        if (atTop) {
+            list.scrollTop = 0
+        } else {
+            // keep the user's place, offer a jump-to-top pill
+            list.scrollTop += list.scrollHeight - heightBefore
+            redditPillCount += fresh.length
+            const pill = document.getElementById('bblf-reddit-pill')
+            if (pill) {
+                pill.textContent = '↑ ' + redditPillCount + ' new'
+                pill.style.display = 'block'
+            }
+        }
+    }
+
+    function renderComment(c) {
+        // textContent everywhere: comment bodies are untrusted and must never become HTML
+        const el = document.createElement('div')
+        el.style.cssText = 'padding:6px 0;border-bottom:1px solid #2a2a2a;'
+        const meta = document.createElement('div')
+        meta.style.cssText = 'color:#8ab4f8;font-size:11px;margin-bottom:2px;'
+        meta.textContent = 'u/' + c.author + ' · ' + timeAgo(c.created_utc) +
+            (typeof c.score === 'number' ? ' · ' + c.score + ' pts' : '')
+        const body = document.createElement('div')
+        body.style.cssText = 'white-space:pre-wrap;word-wrap:break-word;'
+        body.textContent = c.body
+        el.appendChild(meta)
+        el.appendChild(body)
+        return el
+    }
+
+    function timeAgo(utcSecs) {
+        const mins = Math.max(0, Math.round((Date.now() / 1000 - utcSecs) / 60))
+        if (mins < 1) return 'now'
+        if (mins < 60) return mins + 'm'
+        const hours = Math.floor(mins / 60)
+        if (hours < 24) return hours + 'h ' + (mins % 60) + 'm'
+        return Math.floor(hours / 24) + 'd'
+    }
+
+    function setPanelStatus(msg, isError) {
+        const status = document.getElementById('bblf-panel-status')
+        if (!status) return
+        status.textContent = msg
+        status.style.color = isError ? '#e07b7b' : '#999'
     }
 
     function updatePanUI() {
