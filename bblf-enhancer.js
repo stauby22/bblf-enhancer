@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BBLF Enhancer
 // @namespace    http://tampermonkey.net/
-// @version      1.6.1
+// @version      1.7
 // @description  Monitor for issues on Big Brother Live Feed streams, reloading or starting video when necessary. Can autoload quad cam, add hotkeys, show video scrubber, and remap fullscreen button to only show video.
 // @author       liquid8d
 // @match        https://www.paramountplus.com/live-tv/stream/big_brother/*
@@ -13,6 +13,11 @@
 
 // ==/UserScript==
 /*
+v 1.7 (2026)
+ - House tab (cast wall): portrait grid with HOH/NOM/SAVED/POV/HN badges
+ - house state auto-parsed from the mod sticky in the feed discussion thread
+ - manualHouseState config override + evictedHouseguests list
+ - Feed/House tab bar in the panel
 v 1.6.1 (2026)
  - open panel pushes the video left (letterboxed, not stretched) so quad view is never covered
 v 1.6 (2026)
@@ -131,6 +136,17 @@ v 1.2
     const redditCommentLimit = 75
     // panel width in px
     const panelWidth = 360
+    // --- cast wall (House tab) ---
+    // portraits live in the repo (assets/cast/bb28); update folder + list each season
+    const castImageBase = 'https://raw.githubusercontent.com/stauby22/bblf-enhancer/phase0/assets/cast/bb28/'
+    const HOUSEGUESTS = ['Angela', 'Ashley', 'Barrett', 'Chuk', 'Dee', 'Drew', 'Haley', 'Jason', 'Kamu', 'Latrice', 'Lyric', 'Mallory', 'Melody', 'Rick', 'Rome', 'Taylor', 'Yash']
+    // the sticky doesn't track evictions - list names here to gray them out
+    const evictedHouseguests = []
+    // manual override for the house state; null = use the parsed reddit sticky. shape matches the parser output:
+    // { day: 7, hoh: [{name:'Dee'}], noms: [{name:'Ashley'}, {name:'Mallory', struck:true}],
+    //   vetoPlayers: [{name:'Barrett'}], pov: {name:'Mallory', note:'used on herself'},
+    //   haveNots: [{name:'Chuk'}], extras: [{label:'HOH Music', value:'Chris Stapleton'}] }
+    const manualHouseState = null
     // autostart video when page is loaded
     const forcePlay = true
     // delay before reloading the page on an error (secs * ms)
@@ -171,6 +187,9 @@ v 1.2
     let redditTimer = null;
     let redditLastDiscover = 0;
     let redditPillCount = 0;
+    let panelTab = 'feed';
+    let houseState = null;
+    let houseStickyBody = null;
 
     if (localStorage.getItem('bblf_video_monitor_attempts')) attempts = (resetScript) ? 0 : parseInt(localStorage.getItem('bblf_video_monitor_attempts'))
 
@@ -550,6 +569,18 @@ v 1.2
         header.appendChild(refreshBtn)
         header.appendChild(closeBtn)
 
+        const tabbar = document.createElement('div')
+        tabbar.id = 'bblf-tabbar'
+        tabbar.style.cssText = 'display:flex;gap:4px;padding:6px 10px;border-bottom:1px solid #333;'
+        ;['feed', 'house'].forEach(function(t) {
+            const b = document.createElement('button')
+            b.dataset.tab = t
+            b.textContent = (t === 'feed') ? 'Feed' : 'House'
+            b.style.cssText = 'flex:1;background:transparent;border:1px solid #666;border-radius:4px;color:#eee;padding:3px 0;cursor:pointer;font:inherit;'
+            b.onclick = function() { switchTab(t) }
+            tabbar.appendChild(b)
+        })
+
         const status = document.createElement('div')
         status.id = 'bblf-panel-status'
         status.style.cssText = 'padding:4px 10px;color:#999;font-size:11px;border-bottom:1px solid #222;'
@@ -561,7 +592,7 @@ v 1.2
 
         const pill = document.createElement('button')
         pill.id = 'bblf-reddit-pill'
-        pill.style.cssText = 'position:absolute;top:64px;left:50%;transform:translateX(-50%);z-index:1;display:none;' +
+        pill.style.cssText = 'position:absolute;top:100px;left:50%;transform:translateX(-50%);z-index:1;display:none;' +
             'background:#1fce6d;color:#111;border:none;border-radius:10px;padding:2px 10px;cursor:pointer;font:11px sans-serif;'
         pill.onclick = function() {
             list.scrollTop = 0
@@ -569,12 +600,24 @@ v 1.2
             pill.style.display = 'none'
         }
 
+        const feedWrap = document.createElement('div')
+        feedWrap.id = 'bblf-tab-feed'
+        feedWrap.style.cssText = 'flex:1;display:flex;flex-direction:column;min-height:0;'
+        feedWrap.appendChild(status)
+        feedWrap.appendChild(list)
+
+        const house = document.createElement('div')
+        house.id = 'bblf-tab-house'
+        house.style.cssText = 'flex:1;display:none;overflow-y:auto;padding:8px 10px;overscroll-behavior:contain;'
+
         panel.appendChild(header)
-        panel.appendChild(status)
-        panel.appendChild(list)
+        panel.appendChild(tabbar)
+        panel.appendChild(feedWrap)
+        panel.appendChild(house)
         panel.appendChild(pill)
         skin.appendChild(panel)
         applyPanel()
+        switchTab(panelTab)
         log('panel added')
     }
 
@@ -687,10 +730,18 @@ v 1.2
         const d = await gmFetchJson(url)
         const list = document.getElementById('bblf-reddit-list')
         if (!list) return
-        var comments = d[1].data.children
+        const all = d[1].data.children
             .filter(function(c) { return c.kind === 't1' })
             .map(function(c) { return c.data })
-            .filter(function(c) { return !c.stickied })
+        // the stickied mod comment carries the house state (Day/HOH/Noms/...) - parse, don't display
+        const sticky = all.find(function(c) { return c.stickied })
+        if (sticky && sticky.body !== houseStickyBody) {
+            houseStickyBody = sticky.body
+            houseState = parseHouseSticky(sticky.body)
+            log('house sticky ' + (houseState ? 'parsed (day ' + houseState.day + ')' : 'found but not parseable'))
+            if (panelTab === 'house') renderHouse()
+        }
+        var comments = all.filter(function(c) { return !c.stickied })
         comments.sort(function(a, b) { return b.created_utc - a.created_utc })
         const fresh = comments.filter(function(c) { return !redditSeen[c.id] })
         if (!fresh.length) return
@@ -738,6 +789,169 @@ v 1.2
         const hours = Math.floor(mins / 60)
         if (hours < 24) return hours + 'h ' + (mins % 60) + 'm'
         return Math.floor(hours / 24) + 'd'
+    }
+
+    // --- cast wall (House tab) ---
+
+    function switchTab(t) {
+        panelTab = t
+        const feed = document.getElementById('bblf-tab-feed')
+        const house = document.getElementById('bblf-tab-house')
+        const pill = document.getElementById('bblf-reddit-pill')
+        if (feed) feed.style.display = (t === 'feed') ? 'flex' : 'none'
+        if (house) house.style.display = (t === 'house') ? 'block' : 'none'
+        if (pill && t !== 'feed') pill.style.display = 'none'
+        const bar = document.getElementById('bblf-tabbar')
+        if (bar) bar.querySelectorAll('button').forEach(function(b) {
+            const active = b.dataset.tab === t
+            b.style.background = active ? '#1fce6d' : 'transparent'
+            b.style.color = active ? '#111' : '#eee'
+            b.style.borderColor = active ? '#1fce6d' : '#666'
+        })
+        if (t === 'house') renderHouse()
+    }
+
+    // parse the mod sticky, e.g.:
+    // **Day 7**
+    // * **HOH**: Dee
+    // * **Noms**: Ashley, ~~Mallory~~, Taylor, Yash
+    // * **POV**: Mallory (used on herself)
+    function parseHouseSticky(body) {
+        try {
+            const state = { day: null, hoh: [], noms: [], vetoPlayers: [], pov: null, haveNots: [], extras: [] }
+            const dayM = body.match(/\*\*Day\s+(\d+)\*\*/i)
+            if (dayM) state.day = parseInt(dayM[1])
+            const lines = body.split('\n')
+            for (var i = 0; i < lines.length; i++) {
+                const m = lines[i].match(/^\s*[*-]\s+\*\*(.+?)\*\*\s*:\s*(.+?)\s*$/)
+                if (!m) continue
+                const key = m[1].trim().toLowerCase()
+                const names = m[2].split(',').map(function(s) {
+                    s = s.trim()
+                    const struck = /~~/.test(s)
+                    const note = (s.match(/\((.*)\)\s*$/) || [])[1] || null
+                    const name = s.replace(/~~/g, '').replace(/\s*\(.*\)\s*$/, '').trim()
+                    return { name: name, struck: struck, note: note }
+                }).filter(function(n) { return n.name })
+                if (key === 'hoh') state.hoh = names
+                else if (key === 'noms' || key === 'nominees' || key === 'nominations') state.noms = names
+                else if (key === 'veto players') state.vetoPlayers = names
+                else if (key === 'pov' || key === 'veto' || key === 'veto winner') state.pov = names[0] || null
+                else if (key === 'have nots' || key === 'have-nots' || key === 'havenots') state.haveNots = names
+                else state.extras.push({ label: m[1].trim(), value: m[2].trim() })
+            }
+            // require at least one game field so random bold lists don't count as a parse
+            if (!state.hoh.length && !state.noms.length && !state.haveNots.length && !state.pov) return null
+            return state
+        } catch (e) {
+            return null
+        }
+    }
+
+    function getHouseState() {
+        return manualHouseState || houseState
+    }
+
+    function renderHouse() {
+        const house = document.getElementById('bblf-tab-house')
+        if (!house) return
+        house.innerHTML = ''
+        const state = getHouseState()
+
+        const headerEl = document.createElement('div')
+        headerEl.style.cssText = 'font-weight:bold;margin-bottom:4px;'
+        headerEl.textContent = (state && state.day) ? 'Day ' + state.day : 'House'
+        house.appendChild(headerEl)
+
+        if (state) {
+            const parts = []
+            if (state.hoh.length) parts.push('HOH ' + state.hoh.map(function(n) { return n.name }).join(', '))
+            const liveNoms = state.noms.filter(function(n) { return !n.struck })
+            if (liveNoms.length) parts.push('Noms ' + liveNoms.map(function(n) { return n.name }).join(', '))
+            if (state.pov) parts.push('POV ' + state.pov.name + (state.pov.note ? ' (' + state.pov.note + ')' : ''))
+            if (parts.length) {
+                const summary = document.createElement('div')
+                summary.style.cssText = 'color:#999;font-size:11px;margin-bottom:8px;'
+                summary.textContent = parts.join(' · ')
+                house.appendChild(summary)
+            }
+        } else {
+            const none = document.createElement('div')
+            none.style.cssText = 'color:#999;font-size:11px;margin-bottom:8px;'
+            none.textContent = houseStickyBody
+                ? 'sticky comment found but not parseable - raw text below the grid'
+                : 'no house data yet (waiting on the thread sticky, open the Feed tab to fetch)'
+            house.appendChild(none)
+        }
+
+        const grid = document.createElement('div')
+        grid.style.cssText = 'display:grid;grid-template-columns:repeat(3,1fr);gap:10px;'
+        HOUSEGUESTS.forEach(function(name) { grid.appendChild(renderCastCard(name, state)) })
+        house.appendChild(grid)
+
+        if (state && state.extras.length) {
+            const ex = document.createElement('div')
+            ex.style.cssText = 'color:#999;font-size:11px;margin-top:8px;'
+            ex.textContent = state.extras.map(function(e) { return e.label + ': ' + e.value }).join(' · ')
+            house.appendChild(ex)
+        }
+        if (!state && houseStickyBody) {
+            const raw = document.createElement('div')
+            raw.style.cssText = 'white-space:pre-wrap;color:#bbb;font-size:12px;margin-top:8px;'
+            raw.textContent = houseStickyBody
+            house.appendChild(raw)
+        }
+    }
+
+    function hgStatus(name, state) {
+        const s = { badges: [], ring: null, dim: false, struck: false }
+        const eq = function(n) { return n && n.name && n.name.toLowerCase() === name.toLowerCase() }
+        if (evictedHouseguests.some(function(n) { return n.toLowerCase() === name.toLowerCase() })) {
+            s.dim = true
+            s.badges.push('EVICTED')
+            return s
+        }
+        if (!state) return s
+        if (state.hoh.some(eq)) { s.badges.push('HOH'); s.ring = '#e8c341' }
+        const nom = state.noms.find(eq)
+        if (nom) {
+            if (nom.struck) { s.badges.push('SAVED'); s.struck = true }
+            else { s.badges.push('NOM'); s.ring = s.ring || '#e05252' }
+        }
+        if (state.pov && eq(state.pov)) { s.badges.push('POV'); s.ring = s.ring || '#1fce6d' }
+        if (state.haveNots.some(eq)) s.badges.push('HN')
+        return s
+    }
+
+    function renderCastCard(name, state) {
+        const st = hgStatus(name, state)
+        const card = document.createElement('div')
+        card.style.cssText = 'text-align:center;' + (st.dim ? 'opacity:0.35;filter:grayscale(1);' : '')
+        const imgWrap = document.createElement('div')
+        imgWrap.style.cssText = 'width:64px;height:64px;margin:0 auto;border-radius:50%;overflow:hidden;' +
+            'border:2px solid ' + (st.ring || '#444') + ';background:#333;'
+        const img = document.createElement('img')
+        img.alt = name
+        img.style.cssText = 'width:100%;height:100%;object-fit:cover;display:block;'
+        img.onerror = function() {
+            // portrait blocked (CSP) or missing: initials circle instead of a broken image
+            const init = document.createElement('div')
+            init.textContent = name.charAt(0).toUpperCase()
+            init.style.cssText = 'width:100%;height:100%;display:flex;align-items:center;justify-content:center;font-size:24px;color:#ccc;'
+            if (img.parentNode === imgWrap) imgWrap.replaceChild(init, img)
+        }
+        img.src = castImageBase + name.toLowerCase() + '.jpg'
+        imgWrap.appendChild(img)
+        const label = document.createElement('div')
+        label.style.cssText = 'font-size:12px;margin-top:3px;' + (st.struck ? 'text-decoration:line-through;color:#999;' : '')
+        label.textContent = name
+        const badges = document.createElement('div')
+        badges.style.cssText = 'font-size:9px;min-height:12px;letter-spacing:0.5px;color:#1fce6d;'
+        badges.textContent = st.badges.join(' ')
+        card.appendChild(imgWrap)
+        card.appendChild(label)
+        card.appendChild(badges)
+        return card
     }
 
     function setPanelStatus(msg, isError) {
