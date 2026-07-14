@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BBLF Enhancer
 // @namespace    http://tampermonkey.net/
-// @version      1.6
+// @version      1.6.1
 // @description  Monitor for issues on Big Brother Live Feed streams, reloading or starting video when necessary. Can autoload quad cam, add hotkeys, show video scrubber, and remap fullscreen button to only show video.
 // @author       liquid8d
 // @match        https://www.paramountplus.com/live-tv/stream/big_brother/*
@@ -13,6 +13,8 @@
 
 // ==/UserScript==
 /*
+v 1.6.1 (2026)
+ - open panel pushes the video left (letterboxed, not stretched) so quad view is never covered
 v 1.6 (2026)
  - sidebar panel ('r' to toggle) with a live r/BigBrother Feed Discussion reader
    - auto-finds the current "Feed Discussion" thread (morning/afternoon/evening/late night)
@@ -587,6 +589,19 @@ v 1.2
         const panel = document.getElementById('bblf-panel')
         if (!panel) return
         panel.style.display = panelOpen ? 'flex' : 'none'
+        // push the video over instead of covering it (video letterboxes, no stretch)
+        var push = document.getElementById('bblf-panel-push')
+        if (panelOpen && !push) {
+            push = document.createElement('style')
+            push.id = 'bblf-panel-push'
+            push.textContent = '.aa-player-skin .player-wrapper { width: calc(100% - ' + panelWidth + 'px) !important; }'
+            document.head.appendChild(push)
+        } else if (!panelOpen && push) {
+            push.parentNode.removeChild(push)
+        }
+        // keep the audio bar centered over the (possibly narrowed) video
+        const bar = document.getElementById('bblf-audio-bar')
+        if (bar) bar.style.left = panelOpen ? 'calc(50% - ' + (panelWidth / 2) + 'px)' : '50%'
         if (panelOpen) redditStart()
         else redditStop()
     }
