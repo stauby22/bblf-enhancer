@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BBLF Enhancer
 // @namespace    http://tampermonkey.net/
-// @version      1.4
+// @version      1.5
 // @description  Monitor for issues on Big Brother Live Feed streams, reloading or starting video when necessary. Can autoload quad cam, add hotkeys, show video scrubber, and remap fullscreen button to only show video.
 // @author       liquid8d
 // @match        https://www.paramountplus.com/live-tv/stream/big_brother/*
@@ -10,6 +10,12 @@
 
 // ==/UserScript==
 /*
+v 1.5 (2026)
+ - quality fix now sets player qualityCategory + refreshQualities (ported from BBViewer extension inject.js)
+   - old method still available via useLegacyQualityFix
+ - 'f' hotkey to fullscreen only the video (disables the P+ SmartTag fullscreen handler)
+ - floating audio bar: L/Center/R pan buttons + gain boost slider
+ - '[' / ']' hotkeys to adjust gain boost
 v 1.4 (2026)
  - no more live feed page, so removed those fixes
  - match live tv streams (live-tv/stream/big_brother/*)
@@ -53,14 +59,21 @@ v 1.2
         { key: 5, action: function() { switchCam(5) } },
         { key: 'q', action: function() { adjustChannel('left') } },
         { key: 'w', action: function() { adjustChannel('none') } },
-        { key: 'e', action: function() { adjustChannel('right') } }
+        { key: 'e', action: function() { adjustChannel('right') } },
+        { key: 'f', action: function() { toggleFullscreen() } },
+        { key: '[', action: function() { setGainBoost(gainBoost - 0.25) } },
+        { key: ']', action: function() { setGainBoost(gainBoost + 0.25) } }
     ]
 
     // force allow up to 1080p resolution
     const qualityFix = true
+    // quality category to force: 'AUTO' or e.g. '540p', '720p', '1080p'
+    const preferredQuality = '1080p'
+    // use the old (v1.4) quality fix instead, with the stream index below
+    const useLegacyQualityFix = false
 	// 0 = 270p, 1 = 360p, 2 = 540p
 	// 3 = 720p, 4 = 1080p (low bitrate), 5 = 1080p (high bitrate)
-    const preferredQuality = 4
+    const legacyQualityIndex = 4
 	const qualityFixAttempts = 5
     // force switch to quad cam on page load
     const autoQuadCam = false
@@ -74,6 +87,12 @@ v 1.2
     const extendedWatch = true
     // enable hotkeys
     const enableHotkeys = true
+    // show floating audio bar (pan + gain boost) over the video
+    const showAudioControls = true
+    // max gain boost multiplier (1 = no boost, boosting too high will distort/clip)
+    const maxGainBoost = 3
+    // enable 'f' hotkey to fullscreen only the video (disables the P+ built-in fullscreen handler)
+    const enableFullscreenHotkey = true
     // autostart video when page is loaded
     const forcePlay = true
     // delay before reloading the page on an error (secs * ms)
@@ -103,6 +122,9 @@ v 1.2
     let domNodes = [];
     let audioNodes = [];
     let dir = 'none';
+    let gainBoost = 1;
+    let currentPan = 'none';
+    let fsDefused = false;
 
     if (localStorage.getItem('bblf_video_monitor_attempts')) attempts = (resetScript) ? 0 : parseInt(localStorage.getItem('bblf_video_monitor_attempts'))
 
@@ -120,6 +142,9 @@ v 1.2
         // enable hotkeys
         if (enableHotkeys) {
             document.onkeydown = function(e) {
+                const t = e.target
+                if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return
+                if (e.ctrlKey || e.metaKey || e.altKey) return
                 for (var i = 0; i < hotkeys.length; i++) {
                     const hotkey = hotkeys[i].key.toString()
                     if (e.key === hotkey || e.code === hotkey) hotkeys[i].action()
@@ -142,11 +167,34 @@ v 1.2
 
     function updateQualities() {
 		const video = document.querySelector('video')
-        const player = video.player
-		const playback = video.player.getAdapter('playback')
-		if (player && playback && (player.bitrate != playback.qualities[preferredQuality].bitrate || !qualityFixed)) {
+		if (!video || !video.player) return
+		const player = video.player
+		const playback = player.getAdapter('playback')
+		if (!playback) return
+		if (useLegacyQualityFix) { updateQualitiesLegacy(video, player, playback); return }
+		// ported from BBViewer extension inject.js: raise limits, refresh, then pin the quality category
+		if (playback.maxHeight != 1080 || playback.maxBitrate != 8128372) {
+			log('applying quality fix (raising limits)...')
+			playback.maxHeight = 1080
+			playback.maxBitrate = 8128372
+			playback.refreshQualities()
+		}
+		if (preferredQuality == 'AUTO') {
+			if (!player.autoQualitySwitching) {
+				player.autoQualitySwitching = true
+				playback.refreshQualities()
+			}
+		} else if (player.qualityCategory != preferredQuality) {
+			log('setting quality category to ' + preferredQuality)
+			player.autoQualitySwitching = false
+			player.qualityCategory = preferredQuality
+		}
+    }
+
+    function updateQualitiesLegacy(video, player, playback) {
+		if (player && playback && (player.bitrate != playback.qualities[legacyQualityIndex].bitrate || !qualityFixed)) {
 			if (qualityAttempts < qualityFixAttempts) {
-				log('applying quality fix...')
+				log('applying quality fix (legacy)...')
 				qualityAttempts += 1
 				playback.maxBitrate = 8128372
 				playback.maxHeight = 1080
@@ -154,7 +202,7 @@ v 1.2
 				video.player.autoQualitySwitching = false
 				playback.qualities = video.player.qualities
 				setTimeout(() => {
-					video.player.bitrate = playback.qualities[preferredQuality].bitrate
+					video.player.bitrate = playback.qualities[legacyQualityIndex].bitrate
 					audioCtx.resume();
 					qualityFixed = true
 				}, 3000)
@@ -218,6 +266,9 @@ v 1.2
                         }
                     } else {
 						log('video is ready and playing.')
+						if (audioCtx.state === 'suspended') audioCtx.resume()
+						if (showAudioControls) ensureAudioBar()
+						if (enableFullscreenHotkey && !fsDefused) defuseSmartTagFullscreen()
 						if (qualityFix) updateQualities()
 						if (removeControls && !controlsRemoved) {
 							log('removing P+ controls')
@@ -266,7 +317,10 @@ v 1.2
         audioNode.gainLeft = audioCtx.createGain();
         audioNode.gainRight = audioCtx.createGain();
 		audioNode.source.connect(audioNode.splitter, 0, 0);
-		audioNode.merger.connect(audioCtx.destination, 0, 0);
+		audioNode.boost = audioCtx.createGain();
+		audioNode.boost.gain.value = gainBoost;
+		audioNode.merger.connect(audioNode.boost, 0, 0);
+		audioNode.boost.connect(audioCtx.destination);
 		audioNode.gainLeft.gain.value = 1;
 		audioNode.gainRight.gain.value = 1;
         //audioNode.splitter.connect(audioNode.gainLeft, 0);
@@ -277,6 +331,8 @@ v 1.2
     }
 
     function adjustChannel(dir) {
+        currentPan = dir
+        updatePanUI()
         audioNodes.forEach((audioNode) => {
             if (dir === 'none') {
 				audioNode.gainLeft.disconnect();
@@ -313,6 +369,89 @@ v 1.2
                 log('audio balance right');
             }
         });
+    }
+
+    function toggleFullscreen() {
+        if (document.fullscreenElement) {
+            document.exitFullscreen()
+        } else {
+            const el = document.querySelector('.aa-player-skin .player-wrapper') || document.querySelector('video')
+            if (el) el.requestFullscreen()
+        }
+    }
+
+    function defuseSmartTagFullscreen() {
+        // stop the P+ player's own fullscreen handler from also acting on 'f' (ported from BBViewer extension inject.js)
+        try {
+            const w = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window
+            if (w.SmartTag && w.SmartTag.capabilities && w.SmartTag.capabilities.utils && w.SmartTag.capabilities.utils.FullScreen) {
+                w.SmartTag.capabilities.utils.FullScreen = null
+                fsDefused = true
+                log('disabled P+ SmartTag fullscreen handler')
+            }
+        } catch (e) {
+            warn('could not disable P+ fullscreen handler: ' + e)
+        }
+    }
+
+    function setGainBoost(val) {
+        gainBoost = Math.min(maxGainBoost, Math.max(1, Math.round(val * 100) / 100))
+        audioNodes.forEach((audioNode) => { if (audioNode.boost) audioNode.boost.gain.value = gainBoost })
+        const slider = document.getElementById('bblf-gain-slider')
+        if (slider) slider.value = gainBoost
+        const label = document.getElementById('bblf-gain-label')
+        if (label) label.textContent = gainBoost.toFixed(2) + 'x'
+        log('gain boost: ' + gainBoost)
+    }
+
+    function ensureAudioBar() {
+        if (document.getElementById('bblf-audio-bar')) return
+        const bar = document.createElement('div')
+        bar.id = 'bblf-audio-bar'
+        bar.style.cssText = 'position:fixed;top:10px;left:50%;transform:translateX(-50%);z-index:2147483647;' +
+            'display:flex;gap:6px;align-items:center;background:rgba(20,20,20,0.75);padding:4px 10px;' +
+            'border-radius:6px;font:12px/1.4 sans-serif;color:#eee;'
+        const pans = [ { pan: 'left', label: 'L' }, { pan: 'none', label: 'Center' }, { pan: 'right', label: 'R' } ]
+        pans.forEach((p) => {
+            const btn = document.createElement('button')
+            btn.textContent = p.label
+            btn.dataset.pan = p.pan
+            btn.style.cssText = 'background:transparent;border:1px solid #666;border-radius:4px;color:#eee;padding:2px 8px;cursor:pointer;font:inherit;'
+            btn.onclick = function() { adjustChannel(p.pan) }
+            bar.appendChild(btn)
+        })
+        const boostLabel = document.createElement('span')
+        boostLabel.textContent = 'Boost'
+        boostLabel.style.marginLeft = '8px'
+        bar.appendChild(boostLabel)
+        const slider = document.createElement('input')
+        slider.id = 'bblf-gain-slider'
+        slider.type = 'range'
+        slider.min = 1
+        slider.max = maxGainBoost
+        slider.step = 0.05
+        slider.value = gainBoost
+        slider.style.width = '80px'
+        slider.oninput = function() { setGainBoost(parseFloat(this.value)) }
+        bar.appendChild(slider)
+        const gainLabel = document.createElement('span')
+        gainLabel.id = 'bblf-gain-label'
+        gainLabel.textContent = gainBoost.toFixed(2) + 'x'
+        bar.appendChild(gainLabel)
+        document.body.appendChild(bar)
+        updatePanUI()
+        log('audio bar added')
+    }
+
+    function updatePanUI() {
+        const bar = document.getElementById('bblf-audio-bar')
+        if (!bar) return
+        bar.querySelectorAll('button[data-pan]').forEach((btn) => {
+            const active = btn.dataset.pan === currentPan
+            btn.style.background = active ? '#1fce6d' : 'transparent'
+            btn.style.color = active ? '#111' : '#eee'
+            btn.style.borderColor = active ? '#1fce6d' : '#666'
+        })
     }
 
     function log(msg) { console.log('BBLF Enhancer: (' + attempts + ') ' + msg) }
