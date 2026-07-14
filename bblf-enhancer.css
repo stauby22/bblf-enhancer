@@ -11,22 +11,53 @@
 	* Bookmark each camera url and change that way
 */
 
-header, footer {
+/* BBLF Enhancer CSS v3 (2026) */
+/*
+ now we only care about big_brother live-tv pages
+*/
+
+/* hide header nav */
+.header__nav {
   display: none;
 }
 
+/* hide user profile selector */
+#user-profiles-menu-trigger {
+  display: none;
+}
+
+/* kids access button */
+#kids-access-button {
+  display: none;
+}
+
+/* hide footer */
+footer {
+  display: none;
+}
+
+/* hide bottom video metadata */
 .video__metadata {
   display: none;
 }
 
-div[data-role="videoContainer"] {
-  z-index: 9999 !important;
+/* hide top menu bar */
+div.top-menu-hint {
+  display: none;
 }
 
-/* CONTROLS
-comment out .controls-manager css if you don't want controls ontop (mute, fullscreen, live tag)
-*/
-
-.controls-manager {
-  z-index: 100000 !important;
+/* hide top/bottom backplanes (black translucent bars under menu+controls) */
+.top-menu-backplane, .controls-backplane {
+  display: none;
 }
+
+
+/* hide live tv overlay */
+div.skin-sidebar-plugin {
+  display: none;
+}
+
+/* uncomment to hide controls */
+/* .controls-manager, .top-menu-manager {
+  display: none;
+} */
