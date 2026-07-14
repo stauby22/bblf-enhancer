@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BBLF Enhancer
 // @namespace    http://tampermonkey.net/
-// @version      1.5.1
+// @version      1.5.2
 // @description  Monitor for issues on Big Brother Live Feed streams, reloading or starting video when necessary. Can autoload quad cam, add hotkeys, show video scrubber, and remap fullscreen button to only show video.
 // @author       liquid8d
 // @match        https://www.paramountplus.com/live-tv/stream/big_brother/*
@@ -10,6 +10,8 @@
 
 // ==/UserScript==
 /*
+v 1.5.2 (2026)
+ - guide overlay is div.live-schedule in BB28, not .skin-sidebar-plugin; hide both
 v 1.5.1 (2026)
  - hideGuideOverlay: hide the Live TV channel guide that pops up when hovering the left side of the video
    (previously required the companion Stylebot CSS; injected by the script now)
@@ -387,8 +389,8 @@ v 1.2
     function ensureStyles() {
         if (document.getElementById('bblf-styles')) return
         var css = ''
-        // from the companion Stylebot CSS (bblf-enhancer.css)
-        if (hideGuideOverlay) css += 'div.skin-sidebar-plugin { display: none !important; }\n'
+        // .live-schedule is the current (BB28) hover channel guide; .skin-sidebar-plugin was the older one from the Stylebot CSS
+        if (hideGuideOverlay) css += 'div.live-schedule, div.skin-sidebar-plugin { display: none !important; }\n'
         if (theaterMode) css += [
             '.header__nav', '#user-profiles-menu-trigger', '#kids-access-button', 'footer',
             '.video__metadata', 'div.top-menu-hint', '.top-menu-backplane', '.controls-backplane'
