@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BBLF Enhancer
 // @namespace    http://tampermonkey.net/
-// @version      1.7
+// @version      1.8
 // @description  Monitor for issues on Big Brother Live Feed streams, reloading or starting video when necessary. Can autoload quad cam, add hotkeys, show video scrubber, and remap fullscreen button to only show video.
 // @author       liquid8d
 // @match        https://www.paramountplus.com/live-tv/stream/big_brother/*
@@ -13,6 +13,10 @@
 
 // ==/UserScript==
 /*
+v 1.8 (2026)
+ - iOS-style skin from the design mock: translucent material panel, segmented control
+   with sliding thumb, system colors (#30d158/#ff453a/#ffd60a), crown + chip badges,
+   hidden scrollbars, restyled audio bar to match
 v 1.7 (2026)
  - House tab (cast wall): portrait grid with HOH/NOM/SAVED/POV/HN badges
  - house state auto-parsed from the mod sticky in the feed discussion thread
@@ -451,6 +455,36 @@ v 1.2
             '.header__nav', '#user-profiles-menu-trigger', '#kids-access-button', 'footer',
             '.video__metadata', 'div.top-menu-hint', '.top-menu-backplane', '.controls-backplane'
         ].join(', ') + ' { display: none !important; }\n'
+        if (enablePanel || showAudioControls) css += [
+            '#bblf-panel { position:absolute; top:0; right:0; bottom:0; width:' + panelWidth + 'px; z-index:2147483646;',
+            '  display:none; flex-direction:column; background:rgba(28,28,30,0.72);',
+            '  backdrop-filter:blur(30px) saturate(180%); -webkit-backdrop-filter:blur(30px) saturate(180%);',
+            '  border-left:0.5px solid rgba(255,255,255,0.12); color:#fff;',
+            '  font-family:-apple-system,BlinkMacSystemFont,\'SF Pro Text\',sans-serif; font-size:13px; -webkit-font-smoothing:antialiased; }',
+            '#bblf-panel ::-webkit-scrollbar { width:0; height:0; }',
+            '#bblf-seg { position:relative; display:flex; background:rgba(118,118,128,0.24); border-radius:9px; padding:2px; height:32px; }',
+            '#bblf-seg-thumb { position:absolute; top:2px; bottom:2px; left:2px; width:calc(50% - 2px); background:rgba(110,110,118,0.92);',
+            '  border-radius:7px; box-shadow:0 1px 3px rgba(0,0,0,0.35); transition:transform 0.34s cubic-bezier(0.34,1.56,0.64,1); }',
+            '.bblf-seg-btn { position:relative; z-index:1; flex:1; border:none; background:none; color:#fff; font-size:13px; font-weight:600; font-family:inherit; cursor:pointer; }',
+            '.bblf-iconbtn { width:28px; height:28px; border-radius:50%; border:none; background:rgba(118,118,128,0.24); color:rgba(255,255,255,0.75);',
+            '  font-size:14px; cursor:pointer; display:flex; align-items:center; justify-content:center; flex-shrink:0; font-family:inherit; }',
+            '.bblf-iconbtn:hover { background:rgba(118,118,128,0.4); color:#fff; }',
+            '.bblf-comment { padding:12px 16px; border-bottom:0.5px solid rgba(255,255,255,0.07); }',
+            '.bblf-c-meta { display:flex; align-items:center; gap:7px; margin-bottom:5px; }',
+            '.bblf-c-user { font-size:13px; font-weight:600; color:#30d158; }',
+            '.bblf-c-time { font-size:12px; color:rgba(235,235,245,0.4); }',
+            '.bblf-c-score { margin-left:auto; font-size:12px; color:rgba(235,235,245,0.5); letter-spacing:0.2px; }',
+            '.bblf-c-body { font-size:13.5px; line-height:1.42; color:rgba(255,255,255,0.86); white-space:pre-wrap; word-wrap:break-word; }',
+            '#bblf-reddit-pill { position:absolute; top:92px; left:50%; transform:translateX(-50%); display:none; align-items:center; gap:5px;',
+            '  padding:6px 14px; border:0.5px solid rgba(255,255,255,0.14); border-radius:16px; background:rgba(48,209,88,0.9); color:#00350f;',
+            '  font-size:12.5px; font-weight:600; font-family:inherit; cursor:pointer; box-shadow:0 4px 14px rgba(0,0,0,0.4); z-index:1; }',
+            '#bblf-reddit-pill:hover { background:rgba(48,209,88,1); }',
+            '.bblf-chip { position:absolute; bottom:-7px; left:50%; transform:translateX(-50%); padding:1.5px 7px; border-radius:6px;',
+            '  font-size:9.5px; font-weight:700; letter-spacing:0.4px; white-space:nowrap; box-shadow:0 1px 2px rgba(0,0,0,0.45); }',
+            '.bblf-card { display:flex; flex-direction:column; align-items:center; gap:10px; }',
+            '.bblf-card-name { font-size:12.5px; font-weight:500; text-align:center; color:rgba(255,255,255,0.92); }',
+            '#bblf-audio-bar input[type=range] { accent-color:#30d158; }'
+        ].join('\n') + '\n'
         if (!css) return
         const style = document.createElement('style')
         style.id = 'bblf-styles'
@@ -501,14 +535,16 @@ v 1.2
         const bar = document.createElement('div')
         bar.id = 'bblf-audio-bar'
         bar.style.cssText = 'position:absolute;top:10px;left:50%;transform:translateX(-50%);z-index:2147483647;' +
-            'display:flex;gap:6px;align-items:center;background:rgba(20,20,20,0.75);padding:4px 10px;' +
-            'border-radius:6px;font:12px/1.4 sans-serif;color:#eee;'
+            'display:flex;gap:6px;align-items:center;background:rgba(28,28,30,0.72);padding:4px 10px;' +
+            'backdrop-filter:blur(30px) saturate(180%);-webkit-backdrop-filter:blur(30px) saturate(180%);' +
+            'border:0.5px solid rgba(255,255,255,0.12);border-radius:9px;color:#fff;' +
+            'font:12px/1.4 -apple-system,BlinkMacSystemFont,sans-serif;-webkit-font-smoothing:antialiased;'
         const pans = [ { pan: 'left', label: 'L' }, { pan: 'none', label: 'Center' }, { pan: 'right', label: 'R' } ]
         pans.forEach((p) => {
             const btn = document.createElement('button')
             btn.textContent = p.label
             btn.dataset.pan = p.pan
-            btn.style.cssText = 'background:transparent;border:1px solid #666;border-radius:4px;color:#eee;padding:2px 8px;cursor:pointer;font:inherit;'
+            btn.style.cssText = 'background:transparent;border:1px solid rgba(118,118,128,0.6);border-radius:6px;color:#fff;padding:2px 8px;cursor:pointer;font:inherit;'
             btn.onclick = function() { adjustChannel(p.pan) }
             bar.appendChild(btn)
         })
@@ -545,76 +581,82 @@ v 1.2
 
         const panel = document.createElement('div')
         panel.id = 'bblf-panel'
-        panel.style.cssText = 'position:absolute;top:0;right:0;bottom:0;width:' + panelWidth + 'px;z-index:2147483646;' +
-            'display:none;flex-direction:column;background:rgba(12,12,12,0.92);color:#eee;' +
-            'font:13px/1.45 sans-serif;border-left:1px solid #333;'
 
-        const header = document.createElement('div')
-        header.style.cssText = 'display:flex;align-items:center;gap:8px;padding:8px 10px;border-bottom:1px solid #333;'
+        // iOS-style segmented control
+        const segWrap = document.createElement('div')
+        segWrap.style.cssText = 'padding:12px 14px 10px;'
+        const seg = document.createElement('div')
+        seg.id = 'bblf-seg'
+        const thumb = document.createElement('div')
+        thumb.id = 'bblf-seg-thumb'
+        seg.appendChild(thumb)
+        ;['feed', 'house'].forEach(function(t) {
+            const b = document.createElement('button')
+            b.className = 'bblf-seg-btn'
+            b.dataset.tab = t
+            b.textContent = (t === 'feed') ? 'Feed' : 'House'
+            b.onclick = function() { switchTab(t) }
+            seg.appendChild(b)
+        })
+        segWrap.appendChild(seg)
+
+        // feed tab
+        const feedWrap = document.createElement('div')
+        feedWrap.id = 'bblf-tab-feed'
+        feedWrap.style.cssText = 'position:relative;flex:1;min-height:0;display:none;flex-direction:column;'
+
+        const head = document.createElement('div')
+        head.style.cssText = 'padding:10px 16px 11px;border-top:0.5px solid rgba(255,255,255,0.08);border-bottom:0.5px solid rgba(255,255,255,0.08);'
+        const headRow = document.createElement('div')
+        headRow.style.cssText = 'display:flex;align-items:center;gap:10px;'
         const title = document.createElement('div')
         title.id = 'bblf-panel-title'
         title.textContent = 'r/' + redditSub
-        title.style.cssText = 'flex:1;font-weight:bold;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;'
+        title.style.cssText = 'font-size:15px;font-weight:600;color:#fff;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex:1;letter-spacing:-0.2px;'
         const refreshBtn = document.createElement('button')
+        refreshBtn.className = 'bblf-iconbtn'
         refreshBtn.textContent = '↻'
         refreshBtn.title = 'refresh now'
-        refreshBtn.style.cssText = 'background:transparent;border:1px solid #666;border-radius:4px;color:#eee;padding:2px 8px;cursor:pointer;font:inherit;'
         refreshBtn.onclick = function() { redditRefresh(true) }
         const closeBtn = document.createElement('button')
+        closeBtn.className = 'bblf-iconbtn'
         closeBtn.textContent = '✕'
+        closeBtn.style.fontSize = '13px'
         closeBtn.title = "close (or press 'r')"
-        closeBtn.style.cssText = refreshBtn.style.cssText
         closeBtn.onclick = function() { togglePanel() }
-        header.appendChild(title)
-        header.appendChild(refreshBtn)
-        header.appendChild(closeBtn)
-
-        const tabbar = document.createElement('div')
-        tabbar.id = 'bblf-tabbar'
-        tabbar.style.cssText = 'display:flex;gap:4px;padding:6px 10px;border-bottom:1px solid #333;'
-        ;['feed', 'house'].forEach(function(t) {
-            const b = document.createElement('button')
-            b.dataset.tab = t
-            b.textContent = (t === 'feed') ? 'Feed' : 'House'
-            b.style.cssText = 'flex:1;background:transparent;border:1px solid #666;border-radius:4px;color:#eee;padding:3px 0;cursor:pointer;font:inherit;'
-            b.onclick = function() { switchTab(t) }
-            tabbar.appendChild(b)
-        })
-
+        headRow.appendChild(title)
+        headRow.appendChild(refreshBtn)
+        headRow.appendChild(closeBtn)
         const status = document.createElement('div')
         status.id = 'bblf-panel-status'
-        status.style.cssText = 'padding:4px 10px;color:#999;font-size:11px;border-bottom:1px solid #222;'
-        status.textContent = 'loading...'
+        status.style.cssText = 'font-size:11.5px;color:rgba(235,235,245,0.45);margin-top:6px;'
+        status.textContent = 'Loading...'
+        head.appendChild(headRow)
+        head.appendChild(status)
 
         const list = document.createElement('div')
         list.id = 'bblf-reddit-list'
-        list.style.cssText = 'flex:1;overflow-y:auto;padding:6px 10px;overscroll-behavior:contain;'
+        list.style.cssText = 'flex:1;min-height:0;overflow-y:auto;overscroll-behavior:contain;'
 
         const pill = document.createElement('button')
         pill.id = 'bblf-reddit-pill'
-        pill.style.cssText = 'position:absolute;top:100px;left:50%;transform:translateX(-50%);z-index:1;display:none;' +
-            'background:#1fce6d;color:#111;border:none;border-radius:10px;padding:2px 10px;cursor:pointer;font:11px sans-serif;'
         pill.onclick = function() {
             list.scrollTop = 0
             redditPillCount = 0
             pill.style.display = 'none'
         }
-
-        const feedWrap = document.createElement('div')
-        feedWrap.id = 'bblf-tab-feed'
-        feedWrap.style.cssText = 'flex:1;display:flex;flex-direction:column;min-height:0;'
-        feedWrap.appendChild(status)
+        feedWrap.appendChild(head)
         feedWrap.appendChild(list)
+        feedWrap.appendChild(pill)
 
+        // house tab
         const house = document.createElement('div')
         house.id = 'bblf-tab-house'
-        house.style.cssText = 'flex:1;display:none;overflow-y:auto;padding:8px 10px;overscroll-behavior:contain;'
+        house.style.cssText = 'flex:1;min-height:0;display:none;flex-direction:column;'
 
-        panel.appendChild(header)
-        panel.appendChild(tabbar)
+        panel.appendChild(segWrap)
         panel.appendChild(feedWrap)
         panel.appendChild(house)
-        panel.appendChild(pill)
         skin.appendChild(panel)
         applyPanel()
         switchTab(panelTab)
@@ -689,13 +731,13 @@ v 1.2
 
     async function redditRefresh(force) {
         try {
-            setPanelStatus('updating...')
+            setPanelStatus('Updating…')
             if (force || !redditThread || (Date.now() - redditLastDiscover) > redditThreadInterval) {
                 await redditDiscover()
                 redditLastDiscover = Date.now()
             }
             await redditFetchComments()
-            setPanelStatus('updated ' + new Date().toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }))
+            setPanelStatus('Updated ' + new Date().toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }) + ' · r/' + redditSub)
         } catch (e) {
             setPanelStatus((e && e.message) ? e.message : String(e), true)
         }
@@ -761,7 +803,7 @@ v 1.2
             const pill = document.getElementById('bblf-reddit-pill')
             if (pill) {
                 pill.textContent = '↑ ' + redditPillCount + ' new'
-                pill.style.display = 'block'
+                pill.style.display = 'flex'
             }
         }
     }
@@ -769,13 +811,23 @@ v 1.2
     function renderComment(c) {
         // textContent everywhere: comment bodies are untrusted and must never become HTML
         const el = document.createElement('div')
-        el.style.cssText = 'padding:6px 0;border-bottom:1px solid #2a2a2a;'
+        el.className = 'bblf-comment'
         const meta = document.createElement('div')
-        meta.style.cssText = 'color:#8ab4f8;font-size:11px;margin-bottom:2px;'
-        meta.textContent = 'u/' + c.author + ' · ' + timeAgo(c.created_utc) +
-            (typeof c.score === 'number' ? ' · ' + c.score + ' pts' : '')
+        meta.className = 'bblf-c-meta'
+        const user = document.createElement('span')
+        user.className = 'bblf-c-user'
+        user.textContent = 'u/' + c.author
+        const time = document.createElement('span')
+        time.className = 'bblf-c-time'
+        time.textContent = timeAgo(c.created_utc)
+        const score = document.createElement('span')
+        score.className = 'bblf-c-score'
+        score.textContent = (typeof c.score === 'number') ? '▲ ' + c.score : ''
+        meta.appendChild(user)
+        meta.appendChild(time)
+        meta.appendChild(score)
         const body = document.createElement('div')
-        body.style.cssText = 'white-space:pre-wrap;word-wrap:break-word;'
+        body.className = 'bblf-c-body'
         body.textContent = c.body
         el.appendChild(meta)
         el.appendChild(body)
@@ -797,17 +849,10 @@ v 1.2
         panelTab = t
         const feed = document.getElementById('bblf-tab-feed')
         const house = document.getElementById('bblf-tab-house')
-        const pill = document.getElementById('bblf-reddit-pill')
         if (feed) feed.style.display = (t === 'feed') ? 'flex' : 'none'
-        if (house) house.style.display = (t === 'house') ? 'block' : 'none'
-        if (pill && t !== 'feed') pill.style.display = 'none'
-        const bar = document.getElementById('bblf-tabbar')
-        if (bar) bar.querySelectorAll('button').forEach(function(b) {
-            const active = b.dataset.tab === t
-            b.style.background = active ? '#1fce6d' : 'transparent'
-            b.style.color = active ? '#111' : '#eee'
-            b.style.borderColor = active ? '#1fce6d' : '#666'
-        })
+        if (house) house.style.display = (t === 'house') ? 'flex' : 'none'
+        const thumb = document.getElementById('bblf-seg-thumb')
+        if (thumb) thumb.style.transform = (t === 'feed') ? 'translateX(0%)' : 'translateX(100%)'
         if (t === 'house') renderHouse()
     }
 
@@ -858,78 +903,108 @@ v 1.2
         house.innerHTML = ''
         const state = getHouseState()
 
-        const headerEl = document.createElement('div')
-        headerEl.style.cssText = 'font-weight:bold;margin-bottom:4px;'
-        headerEl.textContent = (state && state.day) ? 'Day ' + state.day : 'House'
-        house.appendChild(headerEl)
+        const head = document.createElement('div')
+        head.style.cssText = 'padding:12px 16px 13px;border-top:0.5px solid rgba(255,255,255,0.08);border-bottom:0.5px solid rgba(255,255,255,0.08);'
+        const dayRow = document.createElement('div')
+        dayRow.style.cssText = 'display:flex;align-items:baseline;gap:9px;'
+        const day = document.createElement('div')
+        day.style.cssText = 'font-size:23px;font-weight:700;color:#fff;letter-spacing:-0.5px;'
+        day.textContent = (state && state.day) ? 'Day ' + state.day : 'House'
+        const remaining = document.createElement('div')
+        remaining.style.cssText = 'font-size:12px;color:rgba(235,235,245,0.42);'
+        remaining.textContent = (HOUSEGUESTS.length - evictedHouseguests.length) + ' remaining'
+        dayRow.appendChild(day)
+        dayRow.appendChild(remaining)
+        head.appendChild(dayRow)
 
+        const summary = document.createElement('div')
+        summary.style.cssText = 'font-size:12px;color:rgba(235,235,245,0.62);margin-top:7px;line-height:1.45;'
         if (state) {
-            const parts = []
-            if (state.hoh.length) parts.push('HOH ' + state.hoh.map(function(n) { return n.name }).join(', '))
-            const liveNoms = state.noms.filter(function(n) { return !n.struck })
-            if (liveNoms.length) parts.push('Noms ' + liveNoms.map(function(n) { return n.name }).join(', '))
-            if (state.pov) parts.push('POV ' + state.pov.name + (state.pov.note ? ' (' + state.pov.note + ')' : ''))
-            if (parts.length) {
-                const summary = document.createElement('div')
-                summary.style.cssText = 'color:#999;font-size:11px;margin-bottom:8px;'
-                summary.textContent = parts.join(' · ')
-                house.appendChild(summary)
+            var first = true
+            const addPart = function(label, color, text) {
+                if (!first) summary.appendChild(document.createTextNode(' · '))
+                const l = document.createElement('span')
+                l.style.cssText = 'color:' + color + ';font-weight:600;'
+                l.textContent = label
+                summary.appendChild(l)
+                summary.appendChild(document.createTextNode(' ' + text))
+                first = false
             }
+            if (state.hoh.length) addPart('HOH', '#ffd60a', state.hoh.map(function(n) { return n.name }).join(', '))
+            const liveNoms = state.noms.filter(function(n) { return !n.struck })
+            if (liveNoms.length) addPart('Noms', '#ff453a', liveNoms.map(function(n) { return n.name }).join(', '))
+            if (state.pov) addPart('POV', '#30d158', state.pov.name + (state.pov.note ? ' (' + state.pov.note + ')' : ''))
+            if (first) summary.textContent = 'no game info parsed yet'
         } else {
-            const none = document.createElement('div')
-            none.style.cssText = 'color:#999;font-size:11px;margin-bottom:8px;'
-            none.textContent = houseStickyBody
-                ? 'sticky comment found but not parseable - raw text below the grid'
-                : 'no house data yet (waiting on the thread sticky, open the Feed tab to fetch)'
-            house.appendChild(none)
+            summary.textContent = houseStickyBody
+                ? 'sticky found but not parseable - raw text below'
+                : 'waiting on the thread sticky (open Feed to fetch)'
         }
+        head.appendChild(summary)
 
+        const scroll = document.createElement('div')
+        scroll.style.cssText = 'flex:1;min-height:0;overflow-y:auto;padding:20px 16px 26px;overscroll-behavior:contain;'
         const grid = document.createElement('div')
-        grid.style.cssText = 'display:grid;grid-template-columns:repeat(3,1fr);gap:10px;'
+        grid.style.cssText = 'display:grid;grid-template-columns:repeat(3,1fr);gap:20px 8px;'
         HOUSEGUESTS.forEach(function(name) { grid.appendChild(renderCastCard(name, state)) })
-        house.appendChild(grid)
+        scroll.appendChild(grid)
 
         if (state && state.extras.length) {
             const ex = document.createElement('div')
-            ex.style.cssText = 'color:#999;font-size:11px;margin-top:8px;'
+            ex.style.cssText = 'font-size:11.5px;color:rgba(235,235,245,0.45);margin-top:16px;text-align:center;'
             ex.textContent = state.extras.map(function(e) { return e.label + ': ' + e.value }).join(' · ')
-            house.appendChild(ex)
+            scroll.appendChild(ex)
         }
         if (!state && houseStickyBody) {
             const raw = document.createElement('div')
-            raw.style.cssText = 'white-space:pre-wrap;color:#bbb;font-size:12px;margin-top:8px;'
+            raw.style.cssText = 'white-space:pre-wrap;font-size:12px;color:rgba(255,255,255,0.6);margin-top:14px;'
             raw.textContent = houseStickyBody
-            house.appendChild(raw)
+            scroll.appendChild(raw)
         }
+        house.appendChild(head)
+        house.appendChild(scroll)
     }
 
     function hgStatus(name, state) {
-        const s = { badges: [], ring: null, dim: false, struck: false }
+        const s = { crown: false, ring: null, chip: null, dim: false, struck: false }
         const eq = function(n) { return n && n.name && n.name.toLowerCase() === name.toLowerCase() }
+        const gray = 'rgba(120,120,128,0.55)'
         if (evictedHouseguests.some(function(n) { return n.toLowerCase() === name.toLowerCase() })) {
             s.dim = true
-            s.badges.push('EVICTED')
+            s.chip = { text: 'OUT', bg: 'rgba(90,90,95,0.55)', color: '#fff' }
             return s
         }
         if (!state) return s
-        if (state.hoh.some(eq)) { s.badges.push('HOH'); s.ring = '#e8c341' }
+        if (state.hoh.some(eq)) { s.crown = true; s.ring = '#ffd60a' }
         const nom = state.noms.find(eq)
-        if (nom) {
-            if (nom.struck) { s.badges.push('SAVED'); s.struck = true }
-            else { s.badges.push('NOM'); s.ring = s.ring || '#e05252' }
+        const isPov = state.pov && eq(state.pov)
+        if (nom && nom.struck) {
+            s.struck = true
+            s.ring = s.ring || gray
+            s.chip = { text: 'SAVED', bg: gray, color: '#fff' }
+        } else if (nom) {
+            s.ring = '#ff453a'
+            s.chip = { text: 'NOM', bg: '#ff453a', color: '#fff' }
         }
-        if (state.pov && eq(state.pov)) { s.badges.push('POV'); s.ring = s.ring || '#1fce6d' }
-        if (state.haveNots.some(eq)) s.badges.push('HN')
+        if (isPov) {
+            s.ring = s.ring || '#30d158'
+            if (!s.chip) s.chip = { text: 'V · POV', bg: '#30d158', color: '#00350f' }
+        }
+        if (!s.chip && state.haveNots.some(eq)) s.chip = { text: 'HAVE-NOT', bg: gray, color: '#fff' }
         return s
     }
 
     function renderCastCard(name, state) {
         const st = hgStatus(name, state)
         const card = document.createElement('div')
-        card.style.cssText = 'text-align:center;' + (st.dim ? 'opacity:0.35;filter:grayscale(1);' : '')
+        card.className = 'bblf-card'
+        if (st.dim) card.style.cssText = 'opacity:0.4;filter:grayscale(1);'
+
+        const wrap = document.createElement('div')
+        wrap.style.cssText = 'position:relative;'
         const imgWrap = document.createElement('div')
-        imgWrap.style.cssText = 'width:64px;height:64px;margin:0 auto;border-radius:50%;overflow:hidden;' +
-            'border:2px solid ' + (st.ring || '#444') + ';background:#333;'
+        imgWrap.style.cssText = 'width:60px;height:60px;border-radius:50%;overflow:hidden;background:#3a3a3c;' +
+            'box-shadow:' + (st.ring ? '0 0 0 2.5px ' + st.ring + ', ' : '') + '0 1px 3px rgba(0,0,0,0.4);'
         const img = document.createElement('img')
         img.alt = name
         img.style.cssText = 'width:100%;height:100%;object-fit:cover;display:block;'
@@ -937,20 +1012,33 @@ v 1.2
             // portrait blocked (CSP) or missing: initials circle instead of a broken image
             const init = document.createElement('div')
             init.textContent = name.charAt(0).toUpperCase()
-            init.style.cssText = 'width:100%;height:100%;display:flex;align-items:center;justify-content:center;font-size:24px;color:#ccc;'
+            init.style.cssText = 'width:100%;height:100%;display:flex;align-items:center;justify-content:center;font-size:21px;font-weight:600;color:rgba(255,255,255,0.95);'
             if (img.parentNode === imgWrap) imgWrap.replaceChild(init, img)
         }
         img.src = castImageBase + name.toLowerCase() + '.jpg'
         imgWrap.appendChild(img)
-        const label = document.createElement('div')
-        label.style.cssText = 'font-size:12px;margin-top:3px;' + (st.struck ? 'text-decoration:line-through;color:#999;' : '')
+        wrap.appendChild(imgWrap)
+        if (st.crown) {
+            const crown = document.createElement('div')
+            crown.textContent = '👑'
+            crown.style.cssText = 'position:absolute;top:-10px;right:-1px;font-size:17px;filter:drop-shadow(0 1px 1px rgba(0,0,0,0.5));transform:rotate(14deg);'
+            wrap.appendChild(crown)
+        }
+        if (st.chip) {
+            const chip = document.createElement('div')
+            chip.className = 'bblf-chip'
+            chip.textContent = st.chip.text
+            chip.style.background = st.chip.bg
+            chip.style.color = st.chip.color
+            wrap.appendChild(chip)
+        }
+        const label = document.createElement('span')
+        label.className = 'bblf-card-name'
         label.textContent = name
-        const badges = document.createElement('div')
-        badges.style.cssText = 'font-size:9px;min-height:12px;letter-spacing:0.5px;color:#1fce6d;'
-        badges.textContent = st.badges.join(' ')
-        card.appendChild(imgWrap)
+        if (st.struck) label.style.cssText = 'text-decoration:line-through;color:rgba(255,255,255,0.5);'
+        else if (st.dim) label.style.color = 'rgba(255,255,255,0.45)'
+        card.appendChild(wrap)
         card.appendChild(label)
-        card.appendChild(badges)
         return card
     }
 
@@ -958,7 +1046,7 @@ v 1.2
         const status = document.getElementById('bblf-panel-status')
         if (!status) return
         status.textContent = msg
-        status.style.color = isError ? '#e07b7b' : '#999'
+        status.style.color = isError ? '#ff453a' : 'rgba(235,235,245,0.45)'
     }
 
     function updatePanUI() {
@@ -966,9 +1054,9 @@ v 1.2
         if (!bar) return
         bar.querySelectorAll('button[data-pan]').forEach((btn) => {
             const active = btn.dataset.pan === currentPan
-            btn.style.background = active ? '#1fce6d' : 'transparent'
-            btn.style.color = active ? '#111' : '#eee'
-            btn.style.borderColor = active ? '#1fce6d' : '#666'
+            btn.style.background = active ? '#30d158' : 'transparent'
+            btn.style.color = active ? '#00350f' : '#fff'
+            btn.style.borderColor = active ? '#30d158' : 'rgba(118,118,128,0.6)'
         })
     }
 
