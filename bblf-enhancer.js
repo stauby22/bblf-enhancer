@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BBLF Enhancer
 // @namespace    http://tampermonkey.net/
-// @version      1.10.1
+// @version      1.11
 // @description  Monitor for issues on Big Brother Live Feed streams, reloading or starting video when necessary. Can autoload quad cam, add hotkeys, show video scrubber, and remap fullscreen button to only show video.
 // @author       liquid8d
 // @match        https://www.paramountplus.com/live-tv/stream/big_brother/*
@@ -13,6 +13,10 @@
 
 // ==/UserScript==
 /*
+v 1.11 (2026)
+ - audio controls (L/C/R pan + gain boost) moved from the top bar into the transport bar
+ - P+ LIVE badge hidden by text match (no stable class); logs the class it finds
+ - sticky nickname aliases: Devens -> Rick, Lala -> Latrice
 v 1.10.1 (2026)
  - theaterMode now on by default and expanded: page scroll locked (no more footer),
    slide-in P+ header nav hidden, hover gradient bars hidden, P+ LIVE badge hidden
@@ -154,7 +158,7 @@ v 1.2
     // theater mode: lock page scrolling and hide P+ chrome (slide-in header nav, footer,
     // metadata, hover gradient bars, their LIVE badge) - our own bars replace all of it
     const theaterMode = true
-    // show floating audio bar (pan + gain boost) over the video
+    // audio controls (pan + gain boost) in the transport bar
     const showAudioControls = true
     // max gain boost multiplier (1 = no boost, boosting too high will distort/clip)
     const maxGainBoost = 3
@@ -191,6 +195,8 @@ v 1.2
     const evictedHouseguests = []
     // localStorage key where auto-detected evictions accumulate (clear it or bump per season)
     const evictedStoreKey = 'bblf_evicted_bb28'
+    // sticky nickname -> cast name (the mod sticky uses nicknames for some houseguests)
+    const NAME_ALIASES = { 'devens': 'Rick', 'lala': 'Latrice' }
     // manual override for the house state; null = use the parsed reddit sticky. shape matches the parser output:
     // { day: 7, hoh: [{name:'Dee'}], noms: [{name:'Ashley'}, {name:'Mallory', struck:true}],
     //   vetoPlayers: [{name:'Barrett'}], pov: {name:'Mallory', note:'used on herself'},
@@ -390,8 +396,8 @@ v 1.2
 						log('video is ready and playing.')
 						if (audioCtx.state === 'suspended') audioCtx.resume()
 						ensureStyles()
-						if (showAudioControls) ensureAudioBar()
 						if (enablePanel) ensurePanel()
+						if (theaterMode) hidePlusLiveBadge()
 						if (enablePlayerControls) updateTransportBar()
 						if (enableFullscreenHotkey && !fsDefused) defuseSmartTagFullscreen()
 						if (qualityFix) updateQualities()
@@ -540,7 +546,7 @@ v 1.2
             '  font-size:9.5px; font-weight:700; letter-spacing:0.4px; white-space:nowrap; box-shadow:0 1px 2px rgba(0,0,0,0.45); }',
             '.bblf-card { display:flex; flex-direction:column; align-items:center; gap:10px; }',
             '.bblf-card-name { font-size:12.5px; font-weight:500; text-align:center; color:rgba(255,255,255,0.92); }',
-            '#bblf-audio-bar input[type=range] { accent-color:#30d158; }',
+            '#bblf-transport input[type=range] { accent-color:#30d158; }',
             '#bblf-seek-toast { position:absolute; bottom:140px; left:50%; transform:translateX(-50%); z-index:2147483647;',
             '  display:none; padding:6px 14px; border-radius:16px; background:rgba(28,28,30,0.72);',
             '  backdrop-filter:blur(30px) saturate(180%); -webkit-backdrop-filter:blur(30px) saturate(180%);',
@@ -602,53 +608,6 @@ v 1.2
         if (label) label.textContent = gainBoost.toFixed(2) + 'x'
         log('gain boost: ' + gainBoost)
     }
-
-    function ensureAudioBar() {
-        if (document.getElementById('bblf-audio-bar')) return
-        // anchor inside the player skin so the bar sits over the video (and shows in fullscreen), not the page header
-        const skin = document.querySelector('.aa-player-skin')
-        if (!skin) return
-        if (getComputedStyle(skin).position === 'static') skin.style.position = 'relative'
-        const bar = document.createElement('div')
-        bar.id = 'bblf-audio-bar'
-        bar.style.cssText = 'position:absolute;top:10px;left:50%;transform:translateX(-50%);z-index:2147483647;' +
-            'display:flex;gap:6px;align-items:center;background:rgba(28,28,30,0.72);padding:4px 10px;' +
-            'backdrop-filter:blur(30px) saturate(180%);-webkit-backdrop-filter:blur(30px) saturate(180%);' +
-            'border:0.5px solid rgba(255,255,255,0.12);border-radius:9px;color:#fff;' +
-            'font:12px/1.4 -apple-system,BlinkMacSystemFont,sans-serif;-webkit-font-smoothing:antialiased;'
-        const pans = [ { pan: 'left', label: 'L' }, { pan: 'none', label: 'Center' }, { pan: 'right', label: 'R' } ]
-        pans.forEach((p) => {
-            const btn = document.createElement('button')
-            btn.textContent = p.label
-            btn.dataset.pan = p.pan
-            btn.style.cssText = 'background:transparent;border:1px solid rgba(118,118,128,0.6);border-radius:6px;color:#fff;padding:2px 8px;cursor:pointer;font:inherit;'
-            btn.onclick = function() { adjustChannel(p.pan) }
-            bar.appendChild(btn)
-        })
-        const boostLabel = document.createElement('span')
-        boostLabel.textContent = 'Boost'
-        boostLabel.style.marginLeft = '8px'
-        bar.appendChild(boostLabel)
-        const slider = document.createElement('input')
-        slider.id = 'bblf-gain-slider'
-        slider.type = 'range'
-        slider.min = 1
-        slider.max = maxGainBoost
-        slider.step = 0.05
-        slider.value = gainBoost
-        slider.style.width = '80px'
-        slider.oninput = function() { setGainBoost(parseFloat(this.value)) }
-        bar.appendChild(slider)
-        const gainLabel = document.createElement('span')
-        gainLabel.id = 'bblf-gain-label'
-        gainLabel.textContent = gainBoost.toFixed(2) + 'x'
-        bar.appendChild(gainLabel)
-        skin.appendChild(bar)
-        updatePanUI()
-        log('audio bar added')
-    }
-
-    // --- player transport controls (buffer-seek logic ported from the BBViewer extension) ---
 
     function getVideoEl() {
         return document.querySelector('.aa-player-skin .player-wrapper video') || document.querySelector('video')
@@ -726,6 +685,30 @@ v 1.2
         return m > 0 ? m + ':' + String(s % 60).padStart(2, '0') : s + 's'
     }
 
+    // P+'s LIVE badge has no stable class we know; find it by its text and hide it.
+    // logs the class it finds so a proper CSS rule can be added later
+    function hidePlusLiveBadge() {
+        const skin = document.querySelector('.aa-player-skin')
+        if (!skin) return
+        const all = skin.querySelectorAll('div, span, button, p')
+        for (var i = 0; i < all.length; i++) {
+            const el = all[i]
+            if (el.childElementCount > 0) continue
+            if (el.dataset.bblfHidden) continue
+            if (el.closest('[id^="bblf-"]')) continue
+            if (el.textContent.trim() !== 'LIVE') continue
+            var target = el
+            while (target.parentElement && target.parentElement !== skin &&
+                   target.parentElement.textContent.trim() === 'LIVE' &&
+                   !target.parentElement.querySelector('video')) {
+                target = target.parentElement
+            }
+            target.dataset.bblfHidden = '1'
+            target.style.setProperty('display', 'none', 'important')
+            log('hid P+ live badge: ' + (target.className || target.tagName))
+        }
+    }
+
     function ensureTransportUi() {
         const skin = document.querySelector('.aa-player-skin')
         if (!skin) return null
@@ -770,10 +753,39 @@ v 1.2
             const sep = document.createElement('div')
             sep.className = 'bblf-tsep'
             bar.appendChild(sep)
+            if (showAudioControls) {
+                ;[{ pan: 'left', label: 'L' }, { pan: 'none', label: 'C' }, { pan: 'right', label: 'R' }].forEach(function(p) {
+                    const b = mk(p.label, p.pan === 'left' ? 'audio left  (q)' : (p.pan === 'none' ? 'audio center  (w)' : 'audio right  (e)'),
+                        function() { adjustChannel(p.pan) })
+                    b.dataset.pan = p.pan
+                    b.style.font = '600 12px -apple-system,BlinkMacSystemFont,sans-serif'
+                    bar.appendChild(b)
+                })
+                const slider = document.createElement('input')
+                slider.id = 'bblf-gain-slider'
+                slider.type = 'range'
+                slider.min = 1
+                slider.max = maxGainBoost
+                slider.step = 0.05
+                slider.value = gainBoost
+                slider.title = 'gain boost  ( [ / ] )'
+                slider.style.cssText = 'width:70px;margin:0 4px;'
+                slider.oninput = function() { setGainBoost(parseFloat(this.value)) }
+                bar.appendChild(slider)
+                const gainLabel = document.createElement('span')
+                gainLabel.id = 'bblf-gain-label'
+                gainLabel.textContent = gainBoost.toFixed(2) + 'x'
+                gainLabel.style.cssText = 'font:600 11px -apple-system,BlinkMacSystemFont,sans-serif;color:rgba(235,235,245,0.6);min-width:34px;'
+                bar.appendChild(gainLabel)
+                const sep2 = document.createElement('div')
+                sep2.className = 'bblf-tsep'
+                bar.appendChild(sep2)
+            }
             bar.appendChild(mk('⧉', 'picture in picture  (p)', function() { playerPip() }))
             bar.appendChild(mk('☰', 'panel  (r)', function() { togglePanel() }))
             bar.appendChild(mk('⤢', 'fullscreen  (f)', function() { toggleFullscreen() }))
             skin.appendChild(bar)
+            updatePanUI()
         }
         return { toast: toast, bar: bar }
     }
@@ -925,8 +937,6 @@ v 1.2
             push.parentNode.removeChild(push)
         }
         // keep the audio bar centered over the (possibly narrowed) video
-        const bar = document.getElementById('bblf-audio-bar')
-        if (bar) bar.style.left = panelOpen ? 'calc(50% - ' + (panelWidth / 2) + 'px)' : '50%'
         const toast = document.getElementById('bblf-seek-toast')
         if (toast) toast.style.left = panelOpen ? 'calc(50% - ' + (panelWidth / 2) + 'px)' : '50%'
         const tbar = document.getElementById('bblf-transport')
@@ -1125,7 +1135,8 @@ v 1.2
                     s = s.trim()
                     const struck = /~~/.test(s)
                     const note = (s.match(/\((.*)\)\s*$/) || [])[1] || null
-                    const name = s.replace(/~~/g, '').replace(/\s*\(.*\)\s*$/, '').trim()
+                    var name = s.replace(/~~/g, '').replace(/\s*\(.*\)\s*$/, '').trim()
+                    name = NAME_ALIASES[name.toLowerCase()] || name
                     return { name: name, struck: struck, note: note }
                 }).filter(function(n) { return n.name })
                 if (key === 'hoh') state.hoh = names
@@ -1332,13 +1343,12 @@ v 1.2
     }
 
     function updatePanUI() {
-        const bar = document.getElementById('bblf-audio-bar')
+        const bar = document.getElementById('bblf-transport')
         if (!bar) return
-        bar.querySelectorAll('button[data-pan]').forEach((btn) => {
+        bar.querySelectorAll('button[data-pan]').forEach(function(btn) {
             const active = btn.dataset.pan === currentPan
-            btn.style.background = active ? '#30d158' : 'transparent'
-            btn.style.color = active ? '#00350f' : '#fff'
-            btn.style.borderColor = active ? '#30d158' : 'rgba(118,118,128,0.6)'
+            btn.style.color = active ? '#30d158' : ''
+            btn.style.background = active ? 'rgba(48,209,88,0.15)' : ''
         })
     }
 
