@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BBLF Enhancer
 // @namespace    http://tampermonkey.net/
-// @version      1.9.1
+// @version      1.10
 // @description  Monitor for issues on Big Brother Live Feed streams, reloading or starting video when necessary. Can autoload quad cam, add hotkeys, show video scrubber, and remap fullscreen button to only show video.
 // @author       liquid8d
 // @match        https://www.paramountplus.com/live-tv/stream/big_brother/*
@@ -13,6 +13,12 @@
 
 // ==/UserScript==
 /*
+v 1.10 (2026)
+ - transport bar (apple-music style): «‹ pause ›» skips, LIVE pill with behind-time,
+   PiP / panel / fullscreen buttons; pauses now stick (forcePlay respects manual pause)
+ - reverted the DVR/seekable experiment: P+ only advertises an ~18s manifest window,
+   and adopting it was capping rewind. buffer-only seeking restored (BBViewer was right)
+ - rewind floor is now the oldest buffered data, even if the buffer fragments
 v 1.9.1 (2026)
  - seek into the stream's DVR window (video.seekable) when it reaches further back
    than the session buffer - rewind can now go beyond the last reload if P+ keeps one
@@ -162,515 +168,25 @@ v 1.2
     const redditCommentLimit = 75
     // panel width in px
     const panelWidth = 360
-    // --- player transport controls ---
-    // rewind/forward within the buffer, go-live, picture-in-picture
-    const enablePlayerControls = true
-    // arrow key skip (secs) and ',' '.' skip (secs)
-    const seekSmall = 30
-    const seekLarge = 300
-    // stay this far behind the live edge when going live, avoids stalls (BBViewer used 2)
-    const liveEdgeMargin = 2
-    // if the stream exposes a DVR window (video.seekable) reaching further back than the
-    // session buffer, allow seeking into it; set false to only ever seek the buffer
-    const preferSeekableRange = true
-    // --- cast wall (House tab) ---
-    // portraits live in the repo (assets/cast/bb28); update folder + list each season
-    const castImageBase = 'https://raw.githubusercontent.com/stauby22/bblf-enhancer/phase0/assets/cast/bb28/'
-    const HOUSEGUESTS = ['Angela', 'Ashley', 'Barrett', 'Chuk', 'Dee', 'Drew', 'Haley', 'Jason', 'Kamu', 'Latrice', 'Lyric', 'Mallory', 'Melody', 'Rick', 'Rome', 'Taylor', 'Yash']
-    // manual extra evictions (the parser also auto-remembers evictions from stickies in localStorage)
-    const evictedHouseguests = []
-    // localStorage key where auto-detected evictions accumulate (clear it or bump per season)
-    const evictedStoreKey = 'bblf_evicted_bb28'
-    // manual override for the house state; null = use the parsed reddit sticky. shape matches the parser output:
-    // { day: 7, hoh: [{name:'Dee'}], noms: [{name:'Ashley'}, {name:'Mallory', struck:true}],
-    //   vetoPlayers: [{name:'Barrett'}], pov: {name:'Mallory', note:'used on herself'},
-    //   haveNots: [{name:'Chuk'}], evicted: [{name:'Ashley', note:'14-0'}], bbb: {name:'Yash'},
-    //   extras: [{label:'HOH Music', value:'Chris Stapleton'}] }
-    const manualHouseState = null
-    // autostart video when page is loaded
-    const forcePlay = true
-    // delay before reloading the page on an error (secs * ms)
-    const reloadDelay = 1 * 1000
-    // frequency to check player status (secs * ms)
-    const monitorInterval = 3 * 1000
-    // max attempts to retry on failures before giving up
-    const retryMaxAttempts = 10
-    // reset the 'retry' attempts in the script, if it is no longer working
-    const resetScript = false
-
-    // DO NOT MODIFY AFTER HERE
-
-    // current camera (only modified to verify quad cam switch)
-    var camNum = getCamera()
-    // current attempts, will fail after retryMaxAttemps reached
-    var attempts = 0
-    // whether the P+ player controls have been removed
-    var controlsRemoved = false
-    // whether quality fix has been added
-    var qualityFixed = false
-	// count attempts at quality fix
-	var qualityAttempts = 0
-
-    // audio control variables
-    const audioCtx = new (window.AudioContext)();
-    let domNodes = [];
-    let audioNodes = [];
-    let dir = 'none';
-    let gainBoost = 1;
-    let currentPan = 'none';
-    let fsDefused = false;
-
-    // panel / reddit state
-    let panelOpen = localStorage.getItem('bblf_panel_open') === '1';
-    let redditThread = null;
-    let redditSeen = {};
-    let redditTimer = null;
-    let redditLastDiscover = 0;
-    let redditPillCount = 0;
-    let panelTab = 'feed';
-    let houseState = null;
-    let houseStickyBody = null;
-    let toastTimer = null;
-    let seekableLogged = false;
-
-    if (localStorage.getItem('bblf_video_monitor_attempts')) attempts = (resetScript) ? 0 : parseInt(localStorage.getItem('bblf_video_monitor_attempts'))
-
-    startup()
-
-	function startup() {
-        log('starting bblf enhancer')
-		log('starting on camera ' + camNum)
-
-		ensureStyles()
-
-		if (autoQuadCam && camNum != 5) {
-			log('switching to quad cam')
-			switchCam(5)
-		}
-
-        // enable hotkeys
-        if (enableHotkeys) {
-            document.onkeydown = function(e) {
-                const t = e.target
-                if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return
-                if (e.ctrlKey || e.metaKey || e.altKey) return
-                for (var i = 0; i < hotkeys.length; i++) {
-                    const hotkey = hotkeys[i].key.toString()
-                    if (e.key === hotkey || e.code === hotkey) {
-                        e.preventDefault()
-                        hotkeys[i].action()
-                    }
-                }
-            }
-            log('hotkeys enabled')
-        }
-
-        // start watching video
-        setInterval(() => {
-            checkVideo();
-        }, monitorInterval);
-    }
-
-	function getCamera() {
-		for (var i = 0; i < LIVETV_CAMS.length; i++) {
-			if (window.location.href == LIVETV_CAMS[i]) return i + 1
-		}
-	}
-
-    function updateQualities() {
-		const video = document.querySelector('video')
-		if (!video || !video.player) return
-		const player = video.player
-		const playback = player.getAdapter('playback')
-		if (!playback) return
-		if (useLegacyQualityFix) { updateQualitiesLegacy(video, player, playback); return }
-		// ported from BBViewer extension inject.js: raise limits, refresh, then pin the quality category
-		if (playback.maxHeight != 1080 || playback.maxBitrate != 8128372) {
-			log('applying quality fix (raising limits)...')
-			playback.maxHeight = 1080
-			playback.maxBitrate = 8128372
-			playback.refreshQualities()
-		}
-		if (preferredQuality == 'AUTO') {
-			if (!player.autoQualitySwitching) {
-				player.autoQualitySwitching = true
-				playback.refreshQualities()
-			}
-		} else if (player.qualityCategory != preferredQuality) {
-			log('setting quality category to ' + preferredQuality)
-			player.autoQualitySwitching = false
-			player.qualityCategory = preferredQuality
-		}
-    }
-
-    function updateQualitiesLegacy(video, player, playback) {
-		if (player && playback && (player.bitrate != playback.qualities[legacyQualityIndex].bitrate || !qualityFixed)) {
-			if (qualityAttempts < qualityFixAttempts) {
-				log('applying quality fix (legacy)...')
-				qualityAttempts += 1
-				playback.maxBitrate = 8128372
-				playback.maxHeight = 1080
-				video.player.maxBitrate = 8128372
-				video.player.autoQualitySwitching = false
-				playback.qualities = video.player.qualities
-				setTimeout(() => {
-					video.player.bitrate = playback.qualities[legacyQualityIndex].bitrate
-					audioCtx.resume();
-					qualityFixed = true
-				}, 3000)
-			} else {
-				log('quality fix attempts maxed, quality fix not working for some reason.')
-			}
-		}
-    }
-
-    function checkVideo() {
-        if (extendedWatch) {
-            const countdownButton = document.querySelector('.stream-countdown-button')
-            if (countdownButton) {
-                log('found stream-countdown-button, clicking')
-                countdownButton.click()
-            }
-            // watch for still watching element and restart
-            const stillWatchingEl = document.querySelector('.timeout-panel-button-container')
-            if (stillWatchingEl) {
-                log('found timeout button, clicking')
-                stillWatchingEl.click()
-            }
-        }
-
-        if (attempts >= retryMaxAttempts) {
-            warn('gave up, max attempts reached. Increase "maxAttempts" or set "resetScript" to true, then manually reload the page.')
-            return
-        }
-
-        // check for smart tag error
-        var errorEl = document.querySelector('.smart-tag-error-panel-content')
-        if (errorEl) {
-            warn('smart tag error found')
-            if (reloadOnError) {
-                // reload the page
-                attempts += 1
-                localStorage.setItem('bblf_video_monitor_attempts', attempts)
-                setTimeout(function() { window.location.reload() }, reloadDelay)
-            }
-        } else {
-            var startPanelEl = document.querySelector('.start-panel.show')
-            if (startPanelEl) {
-                warn('start panel is showing, trying to click to start video (manual user intervention may be required)')
-                var clickEl = document.querySelector('.start-panel-click-overlay')
-                if (clickEl) clickEl.click()
-            } else {
-                var videoEl = document.querySelector('.aa-player-skin .player-wrapper video')
-                if (videoEl) {
-					addNode(videoEl)
-					if (videoEl.paused) {
-                        if (forcePlay) {
-                            // attempt to unpause video
-                            info('video is available and paused, trying to force play (manual user intervention may be required)')
-                            const el = document.getElementById('mcplayer')
-                            if (el) el.click()
-                            attempts += 1
-                            localStorage.setItem('bblf_video_monitor_attempts', attempts)
-                        } else {
-                            // video is ok, but user doesn't want to forcePlay it
-                            info('video is available and paused, "forcePlay" is not enabled')
-                        }
-                    } else {
-						log('video is ready and playing.')
-						if (audioCtx.state === 'suspended') audioCtx.resume()
-						ensureStyles()
-						if (showAudioControls) ensureAudioBar()
-						if (enablePanel) ensurePanel()
-						if (enablePlayerControls) updateLiveChip()
-						if (enableFullscreenHotkey && !fsDefused) defuseSmartTagFullscreen()
-						if (qualityFix) updateQualities()
-						if (removeControls && !controlsRemoved) {
-							log('removing P+ controls')
-							controlsRemoved = true
-							// remove the player elements
-							const playerEls = ['.controls-backplane', '.controls-manager', '.top-menu-backplane']
-							for (var i = 0; i < playerEls.length; i++) {
-								var el = document.querySelector(playerEls[i])
-								el.parentNode.removeChild(el)
-							}
-							// enable built-in video controls allowing scrubbing
-						}
-						if (controlsRemoved) videoEl.controls = true
-                    }
-                    attempts = 0
-                    localStorage.setItem('bblf_video_monitor_attempts', 0)
-                } else {
-                    // missing video element, something else is wrong here
-                    warn('unable to find an error or the video element, you might need to manually reload the page')
-                }
-            }
-        }
-    }
-
-    function switchCam(num) {
-        const url = LIVETV_CAMS[num - 1]
-        window.open(url, '_self')
-    }
-
-    function addNode(node) {
-        if (!domNodes.includes(node)) {
-            domNodes.push(node);
-            log('DOM node added to list');
-            hookUpWebAudio(node);
-			adjustChannel('none');
-            log('hooked up web audio node');
-        }
-    }
-
-    function hookUpWebAudio(node) {
-        let audioNode = {};
-        audioNode.source = audioCtx.createMediaElementSource(node);
-		audioNode.merger = audioCtx.createChannelMerger(2);
-        audioNode.splitter = audioCtx.createChannelSplitter(2);
-        audioNode.source.connect(audioNode.splitter, 0, 0);
-        audioNode.gainLeft = audioCtx.createGain();
-        audioNode.gainRight = audioCtx.createGain();
-		audioNode.source.connect(audioNode.splitter, 0, 0);
-		audioNode.boost = audioCtx.createGain();
-		audioNode.boost.gain.value = gainBoost;
-		audioNode.merger.connect(audioNode.boost, 0, 0);
-		audioNode.boost.connect(audioCtx.destination);
-		audioNode.gainLeft.gain.value = 1;
-		audioNode.gainRight.gain.value = 1;
-        //audioNode.splitter.connect(audioNode.gainLeft, 0);
-        //audioNode.splitter.connect(audioNode.gainRight, 1);
-        //audioNode.gainLeft.connect(audioCtx.destination, 0);
-        //audioNode.gainRight.connect(audioCtx.destination, 0);
-        audioNodes.push(audioNode);
-    }
-
-    function adjustChannel(dir) {
-        currentPan = dir
-        updatePanUI()
-        audioNodes.forEach((audioNode) => {
-            if (dir === 'none') {
-				audioNode.gainLeft.disconnect();
-				audioNode.gainRight.disconnect();
-				audioNode.splitter.disconnect();
-				audioNode.gainLeft.connect(audioNode.merger, 0, 0);
-				audioNode.gainRight.connect(audioNode.merger, 0, 1);
-				audioNode.splitter.connect(audioNode.gainLeft, 0);
-				audioNode.splitter.connect(audioNode.gainRight, 1);
-				audioNode.gainLeft.gain.value = 1;
-				audioNode.gainRight.gain.value = 1;
-				log('audio balance reset');
-            } else if (dir === 'left') {
-				audioNode.gainLeft.disconnect();
-				audioNode.gainRight.disconnect();
-				audioNode.splitter.disconnect();
-				audioNode.gainLeft.connect(audioNode.merger, 0, 0);
-				audioNode.gainRight.connect(audioNode.merger, 0, 1);
-				audioNode.splitter.connect(audioNode.gainLeft, 0);
-				audioNode.splitter.connect(audioNode.gainRight, 0);
-				audioNode.gainLeft.gain.value = 1;
-				audioNode.gainRight.gain.value = 1;
-                log('audio balance left');
-            } else {
-				audioNode.gainLeft.disconnect();
-				audioNode.gainRight.disconnect();
-				audioNode.splitter.disconnect();
-				audioNode.gainLeft.connect(audioNode.merger, 0, 0);
-				audioNode.gainRight.connect(audioNode.merger, 0, 1);
-				audioNode.splitter.connect(audioNode.gainLeft, 1);
-				audioNode.splitter.connect(audioNode.gainRight, 1);
-				audioNode.gainLeft.gain.value = 1;
-				audioNode.gainRight.gain.value = 1;
-                log('audio balance right');
-            }
-        });
-    }
-
-    function ensureStyles() {
-        if (document.getElementById('bblf-styles')) return
-        var css = ''
-        // .live-schedule .channels-container is the (BB28) hover channel guide list; hiding all of
-        // .live-schedule also killed the player top bar (menu/cast/captions), so only hide the list.
-        // .skin-sidebar-plugin was the older guide from the Stylebot CSS
-        if (hideGuideOverlay) css += '.live-schedule .channels-container, div.skin-sidebar-plugin { display: none !important; }\n'
-        if (theaterMode) css += [
-            '.header__nav', '#user-profiles-menu-trigger', '#kids-access-button', 'footer',
-            '.video__metadata', 'div.top-menu-hint', '.top-menu-backplane', '.controls-backplane'
-        ].join(', ') + ' { display: none !important; }\n'
-        if (enablePanel || showAudioControls) css += [
-            '#bblf-panel { position:absolute; top:0; right:0; bottom:0; width:' + panelWidth + 'px; z-index:2147483646;',
-            '  display:none; flex-direction:column; background:rgba(28,28,30,0.72);',
-            '  backdrop-filter:blur(30px) saturate(180%); -webkit-backdrop-filter:blur(30px) saturate(180%);',
-            '  border-left:0.5px solid rgba(255,255,255,0.12); color:#fff;',
-            '  font-family:-apple-system,BlinkMacSystemFont,\'SF Pro Text\',sans-serif; font-size:13px; -webkit-font-smoothing:antialiased; }',
-            '#bblf-panel ::-webkit-scrollbar { width:0; height:0; }',
-            '#bblf-seg { position:relative; display:flex; background:rgba(118,118,128,0.24); border-radius:9px; padding:2px; height:32px; }',
-            '#bblf-seg-thumb { position:absolute; top:2px; bottom:2px; left:2px; width:calc(50% - 2px); background:rgba(110,110,118,0.92);',
-            '  border-radius:7px; box-shadow:0 1px 3px rgba(0,0,0,0.35); transition:transform 0.34s cubic-bezier(0.34,1.56,0.64,1); }',
-            '.bblf-seg-btn { position:relative; z-index:1; flex:1; border:none; background:none; color:#fff; font-size:13px; font-weight:600; font-family:inherit; cursor:pointer; }',
-            '.bblf-iconbtn { width:28px; height:28px; border-radius:50%; border:none; background:rgba(118,118,128,0.24); color:rgba(255,255,255,0.75);',
-            '  font-size:14px; cursor:pointer; display:flex; align-items:center; justify-content:center; flex-shrink:0; font-family:inherit; }',
-            '.bblf-iconbtn:hover { background:rgba(118,118,128,0.4); color:#fff; }',
-            '.bblf-comment { padding:12px 16px; border-bottom:0.5px solid rgba(255,255,255,0.07); }',
-            '.bblf-c-meta { display:flex; align-items:center; gap:7px; margin-bottom:5px; }',
-            '.bblf-c-user { font-size:13px; font-weight:600; color:#30d158; }',
-            '.bblf-c-time { font-size:12px; color:rgba(235,235,245,0.4); }',
-            '.bblf-c-score { margin-left:auto; font-size:12px; color:rgba(235,235,245,0.5); letter-spacing:0.2px; }',
-            '.bblf-c-body { font-size:13.5px; line-height:1.42; color:rgba(255,255,255,0.86); white-space:pre-wrap; word-wrap:break-word; }',
-            '#bblf-reddit-pill { position:absolute; top:92px; left:50%; transform:translateX(-50%); display:none; align-items:center; gap:5px;',
-            '  padding:6px 14px; border:0.5px solid rgba(255,255,255,0.14); border-radius:16px; background:rgba(48,209,88,0.9); color:#00350f;',
-            '  font-size:12.5px; font-weight:600; font-family:inherit; cursor:pointer; box-shadow:0 4px 14px rgba(0,0,0,0.4); z-index:1; }',
-            '#bblf-reddit-pill:hover { background:rgba(48,209,88,1); }',
-            '.bblf-chip { position:absolute; bottom:-7px; left:50%; transform:translateX(-50%); padding:1.5px 7px; border-radius:6px;',
-            '  font-size:9.5px; font-weight:700; letter-spacing:0.4px; white-space:nowrap; box-shadow:0 1px 2px rgba(0,0,0,0.45); }',
-            '.bblf-card { display:flex; flex-direction:column; align-items:center; gap:10px; }',
-            '.bblf-card-name { font-size:12.5px; font-weight:500; text-align:center; color:rgba(255,255,255,0.92); }',
-            '#bblf-audio-bar input[type=range] { accent-color:#30d158; }',
-            '#bblf-seek-toast { position:absolute; bottom:96px; left:50%; transform:translateX(-50%); z-index:2147483647;',
-            '  display:none; padding:6px 14px; border-radius:16px; background:rgba(28,28,30,0.72);',
-            '  backdrop-filter:blur(30px) saturate(180%); -webkit-backdrop-filter:blur(30px) saturate(180%);',
-            '  border:0.5px solid rgba(255,255,255,0.14); color:#fff; pointer-events:none; opacity:0;',
-            '  font:600 12.5px -apple-system,BlinkMacSystemFont,sans-serif; transition:opacity 0.25s; box-shadow:0 4px 14px rgba(0,0,0,0.4); }',
-            '#bblf-live-chip { position:absolute; bottom:96px; left:22px; z-index:2147483647; display:none; align-items:center; gap:6px;',
-            '  padding:6px 12px; border-radius:16px; border:0.5px solid rgba(255,255,255,0.14); background:rgba(28,28,30,0.72);',
-            '  backdrop-filter:blur(30px) saturate(180%); -webkit-backdrop-filter:blur(30px) saturate(180%);',
-            '  color:#fff; font:600 12px -apple-system,BlinkMacSystemFont,sans-serif; cursor:pointer; box-shadow:0 4px 14px rgba(0,0,0,0.4); }',
-            '#bblf-live-chip:hover { background:rgba(44,44,46,0.88); }',
-            '.bblf-live-dot { width:7px; height:7px; border-radius:50%; background:#ff453a; box-shadow:0 0 8px #ff453a; display:inline-block; }'
-        ].join('\n') + '\n'
-        if (!css) return
-        const style = document.createElement('style')
-        style.id = 'bblf-styles'
-        style.textContent = css
-        document.head.appendChild(style)
-        log('styles injected')
-    }
-
-    function toggleFullscreen() {
-        if (document.fullscreenElement) {
-            document.exitFullscreen()
-        } else {
-            const el = document.querySelector('.aa-player-skin .player-wrapper') || document.querySelector('video')
-            if (el) el.requestFullscreen()
-        }
-    }
-
-    function defuseSmartTagFullscreen() {
-        // stop the P+ player's own fullscreen handler from also acting on 'f' (ported from BBViewer extension inject.js)
-        try {
-            const w = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window
-            if (w.SmartTag && w.SmartTag.capabilities && w.SmartTag.capabilities.utils && w.SmartTag.capabilities.utils.FullScreen) {
-                w.SmartTag.capabilities.utils.FullScreen = null
-                fsDefused = true
-                log('disabled P+ SmartTag fullscreen handler')
-            }
-        } catch (e) {
-            warn('could not disable P+ fullscreen handler: ' + e)
-        }
-    }
-
-    function setGainBoost(val) {
-        gainBoost = Math.min(maxGainBoost, Math.max(1, Math.round(val * 100) / 100))
-        audioNodes.forEach((audioNode) => { if (audioNode.boost) audioNode.boost.gain.value = gainBoost })
-        const slider = document.getElementById('bblf-gain-slider')
-        if (slider) slider.value = gainBoost
-        const label = document.getElementById('bblf-gain-label')
-        if (label) label.textContent = gainBoost.toFixed(2) + 'x'
-        log('gain boost: ' + gainBoost)
-    }
-
-    function ensureAudioBar() {
-        if (document.getElementById('bblf-audio-bar')) return
-        // anchor inside the player skin so the bar sits over the video (and shows in fullscreen), not the page header
-        const skin = document.querySelector('.aa-player-skin')
-        if (!skin) return
-        if (getComputedStyle(skin).position === 'static') skin.style.position = 'relative'
-        const bar = document.createElement('div')
-        bar.id = 'bblf-audio-bar'
-        bar.style.cssText = 'position:absolute;top:10px;left:50%;transform:translateX(-50%);z-index:2147483647;' +
-            'display:flex;gap:6px;align-items:center;background:rgba(28,28,30,0.72);padding:4px 10px;' +
-            'backdrop-filter:blur(30px) saturate(180%);-webkit-backdrop-filter:blur(30px) saturate(180%);' +
-            'border:0.5px solid rgba(255,255,255,0.12);border-radius:9px;color:#fff;' +
-            'font:12px/1.4 -apple-system,BlinkMacSystemFont,sans-serif;-webkit-font-smoothing:antialiased;'
-        const pans = [ { pan: 'left', label: 'L' }, { pan: 'none', label: 'Center' }, { pan: 'right', label: 'R' } ]
-        pans.forEach((p) => {
-            const btn = document.createElement('button')
-            btn.textContent = p.label
-            btn.dataset.pan = p.pan
-            btn.style.cssText = 'background:transparent;border:1px solid rgba(118,118,128,0.6);border-radius:6px;color:#fff;padding:2px 8px;cursor:pointer;font:inherit;'
-            btn.onclick = function() { adjustChannel(p.pan) }
-            bar.appendChild(btn)
-        })
-        const boostLabel = document.createElement('span')
-        boostLabel.textContent = 'Boost'
-        boostLabel.style.marginLeft = '8px'
-        bar.appendChild(boostLabel)
-        const slider = document.createElement('input')
-        slider.id = 'bblf-gain-slider'
-        slider.type = 'range'
-        slider.min = 1
-        slider.max = maxGainBoost
-        slider.step = 0.05
-        slider.value = gainBoost
-        slider.style.width = '80px'
-        slider.oninput = function() { setGainBoost(parseFloat(this.value)) }
-        bar.appendChild(slider)
-        const gainLabel = document.createElement('span')
-        gainLabel.id = 'bblf-gain-label'
-        gainLabel.textContent = gainBoost.toFixed(2) + 'x'
-        bar.appendChild(gainLabel)
-        skin.appendChild(bar)
-        updatePanUI()
-        log('audio bar added')
-    }
-
     // --- player transport controls (buffer-seek logic ported from the BBViewer extension) ---
 
     function getVideoEl() {
         return document.querySelector('.aa-player-skin .player-wrapper video') || document.querySelector('video')
     }
 
-    // the buffered range we're currently inside (P+ live duration/seekable are unreliable; the
-    // extension seeks against video.buffered for this site, so we do too)
+    // full buffered span: oldest data we still hold .. newest. P+ live duration/seekable are
+    // useless here (the manifest window is ~18s) - the MSE buffer is the real rewind surface.
     function bufferedRange(video) {
         const b = video.buffered
         if (!b || b.length === 0) return null
-        for (var i = 0; i < b.length; i++) {
-            if (video.currentTime >= b.start(i) && video.currentTime <= b.end(i)) {
-                return { start: b.start(i), end: b.end(i) }
-            }
-        }
-        return { start: b.start(b.length - 1), end: b.end(b.length - 1) }
-    }
-
-    // widest safe seek window: the DVR/seekable range when it reaches further back
-    // than the session buffer, otherwise the buffer itself
-    function seekBounds(video) {
-        const buf = bufferedRange(video)
-        var start = buf ? buf.start : null
-        var end = buf ? buf.end : null
-        if (preferSeekableRange && video.seekable && video.seekable.length > 0) {
-            const ss = video.seekable.start(0)
-            const se = video.seekable.end(video.seekable.length - 1)
-            if (start === null || ss < start - 5) {
-                if (!seekableLogged) {
-                    seekableLogged = true
-                    log('DVR window detected: seekable ' + Math.floor(ss) + '..' + Math.floor(se) +
-                        (buf ? ' vs buffer ' + Math.floor(buf.start) + '..' + Math.floor(buf.end) : ' (no buffer info)'))
-                }
-                start = ss
-                end = (end === null) ? se : Math.max(end, se)
-            }
-        }
-        if (start === null) return null
-        return { start: start, end: end }
+        return { start: b.start(0), end: b.end(b.length - 1) }
     }
 
     function playerSkip(secs) {
         if (!enablePlayerControls) return
         const video = getVideoEl()
         if (!video) return
-        const range = seekBounds(video)
+        const range = bufferedRange(video)
         if (!range) { showSeekToast('nothing buffered yet'); return }
         const liveEdge = Math.floor(range.end) - liveEdgeMargin
         const floor = Math.floor(range.start)
@@ -682,19 +198,34 @@ v 1.2
         const behind = liveEdge - target
         showSeekToast((secs < 0 ? '− ' : '+ ') + formatSecs(Math.abs(secs)) +
             (behind > liveEdgeMargin + 2 ? '  ·  ' + formatSecs(behind) + ' behind' : '  ·  live'))
-        updateLiveChip()
+        updateTransportBar()
     }
 
     function playerGoLive() {
         if (!enablePlayerControls) return
         const video = getVideoEl()
         if (!video) return
+        userPaused = false
         if (video.paused) video.play()
-        const range = seekBounds(video)
+        const range = bufferedRange(video)
         if (range) video.currentTime = Math.floor(range.end) - liveEdgeMargin
         log('go live')
         showSeekToast('● LIVE')
-        updateLiveChip()
+        updateTransportBar()
+    }
+
+    function playerTogglePause() {
+        if (!enablePlayerControls) return
+        const video = getVideoEl()
+        if (!video) return
+        if (video.paused) {
+            userPaused = false
+            video.play()
+        } else {
+            userPaused = true
+            video.pause()
+        }
+        updateTransportBar()
     }
 
     function playerPip() {
@@ -725,21 +256,46 @@ v 1.2
             toast.id = 'bblf-seek-toast'
             skin.appendChild(toast)
         }
-        var chip = document.getElementById('bblf-live-chip')
-        if (!chip) {
-            chip = document.createElement('button')
-            chip.id = 'bblf-live-chip'
-            chip.title = 'jump back to live'
+        var bar = document.getElementById('bblf-transport')
+        if (!bar && showTransportBar) {
+            bar = document.createElement('div')
+            bar.id = 'bblf-transport'
+            const mk = function(glyph, tip, fn, id) {
+                const b = document.createElement('button')
+                b.className = 'bblf-tbtn'
+                b.textContent = glyph
+                b.title = tip
+                if (id) b.id = id
+                b.onclick = fn
+                return b
+            }
+            bar.appendChild(mk('«', 'back 5 min  (,)', function() { playerSkip(-seekLarge) }))
+            bar.appendChild(mk('‹', 'back 30s  (←)', function() { playerSkip(-seekSmall) }))
+            bar.appendChild(mk('❚❚', 'pause / play', function() { playerTogglePause() }, 'bblf-t-play'))
+            bar.appendChild(mk('›', 'forward 30s  (→)', function() { playerSkip(seekSmall) }))
+            bar.appendChild(mk('»', 'forward 5 min  (.)', function() { playerSkip(seekLarge) }))
+            const pill = document.createElement('button')
+            pill.id = 'bblf-live-pill'
+            pill.title = 'jump to live  (l)'
             const dot = document.createElement('span')
             dot.className = 'bblf-live-dot'
-            const label = document.createElement('span')
-            label.id = 'bblf-live-chip-label'
-            chip.appendChild(dot)
-            chip.appendChild(label)
-            chip.onclick = function() { playerGoLive() }
-            skin.appendChild(chip)
+            dot.id = 'bblf-live-dot'
+            const lbl = document.createElement('span')
+            lbl.id = 'bblf-live-label'
+            lbl.textContent = 'LIVE'
+            pill.appendChild(dot)
+            pill.appendChild(lbl)
+            pill.onclick = function() { playerGoLive() }
+            bar.appendChild(pill)
+            const sep = document.createElement('div')
+            sep.className = 'bblf-tsep'
+            bar.appendChild(sep)
+            bar.appendChild(mk('⧉', 'picture in picture  (p)', function() { playerPip() }))
+            bar.appendChild(mk('☰', 'panel  (r)', function() { togglePanel() }))
+            bar.appendChild(mk('⤢', 'fullscreen  (f)', function() { toggleFullscreen() }))
+            skin.appendChild(bar)
         }
-        return { toast: toast, chip: chip }
+        return { toast: toast, bar: bar }
     }
 
     function showSeekToast(text) {
@@ -755,20 +311,24 @@ v 1.2
         }, 1200)
     }
 
-    function updateLiveChip() {
+    function updateTransportBar() {
+        if (!enablePlayerControls) return
         const ui = ensureTransportUi()
-        if (!ui) return
+        if (!ui || !ui.bar) return
         const video = getVideoEl()
-        const range = video ? seekBounds(video) : null
-        if (!video || !range) { ui.chip.style.display = 'none'; return }
+        if (!video) return
+        const playBtn = document.getElementById('bblf-t-play')
+        if (playBtn) playBtn.textContent = video.paused ? '▶' : '❚❚'
+        const range = bufferedRange(video)
+        const pill = document.getElementById('bblf-live-pill')
+        const label = document.getElementById('bblf-live-label')
+        const dot = document.getElementById('bblf-live-dot')
+        if (!range || !pill || !label) return
         const behind = Math.floor(range.end) - liveEdgeMargin - Math.floor(video.currentTime)
-        const label = document.getElementById('bblf-live-chip-label')
-        if (video.paused || behind > liveEdgeMargin + 3) {
-            if (label) label.textContent = (video.paused ? 'paused' : formatSecs(behind) + ' behind') + '  ·  go live'
-            ui.chip.style.display = 'flex'
-        } else {
-            ui.chip.style.display = 'none'
-        }
+        const atEdge = !video.paused && behind <= liveEdgeMargin + 3
+        label.textContent = atEdge ? 'LIVE' : (video.paused ? 'PAUSED' : formatSecs(behind))
+        pill.className = atEdge ? '' : 'bblf-behind'
+        if (dot) dot.style.opacity = atEdge ? '1' : '0.35'
     }
 
     // --- sidebar panel + reddit feed discussion reader ---
@@ -889,6 +449,8 @@ v 1.2
         if (bar) bar.style.left = panelOpen ? 'calc(50% - ' + (panelWidth / 2) + 'px)' : '50%'
         const toast = document.getElementById('bblf-seek-toast')
         if (toast) toast.style.left = panelOpen ? 'calc(50% - ' + (panelWidth / 2) + 'px)' : '50%'
+        const tbar = document.getElementById('bblf-transport')
+        if (tbar) tbar.style.left = panelOpen ? 'calc(50% - ' + (panelWidth / 2) + 'px)' : '50%'
         if (panelOpen) redditStart()
         else redditStop()
     }
