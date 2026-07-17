@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BBLF Enhancer
 // @namespace    http://tampermonkey.net/
-// @version      1.10
+// @version      1.10.1
 // @description  Monitor for issues on Big Brother Live Feed streams, reloading or starting video when necessary. Can autoload quad cam, add hotkeys, show video scrubber, and remap fullscreen button to only show video.
 // @author       liquid8d
 // @match        https://www.paramountplus.com/live-tv/stream/big_brother/*
@@ -13,6 +13,10 @@
 
 // ==/UserScript==
 /*
+v 1.10.1 (2026)
+ - theaterMode now on by default and expanded: page scroll locked (no more footer),
+   slide-in P+ header nav hidden, hover gradient bars hidden, P+ LIVE badge hidden
+ - transport bar spacing loosened (gaps, padding, pill)
 v 1.10 (2026)
  - transport bar (apple-music style): «‹ pause ›» skips, LIVE pill with behind-time,
    PiP / panel / fullscreen buttons; pauses now stick (forcePlay respects manual pause)
@@ -147,8 +151,9 @@ v 1.2
     // hide the Live TV channel guide overlay (pops up when hovering the left side of the video)
     // note: with this on, use the 1-5 hotkeys or bookmarks to change cameras
     const hideGuideOverlay = true
-    // hide P+ page chrome too (header, footer, video metadata) - same as the Stylebot CSS
-    const theaterMode = false
+    // theater mode: lock page scrolling and hide P+ chrome (slide-in header nav, footer,
+    // metadata, hover gradient bars, their LIVE badge) - our own bars replace all of it
+    const theaterMode = true
     // show floating audio bar (pan + gain boost) over the video
     const showAudioControls = true
     // max gain boost multiplier (1 = no boost, boosting too high will distort/clip)
@@ -498,10 +503,15 @@ v 1.2
         // .live-schedule also killed the player top bar (menu/cast/captions), so only hide the list.
         // .skin-sidebar-plugin was the older guide from the Stylebot CSS
         if (hideGuideOverlay) css += '.live-schedule .channels-container, div.skin-sidebar-plugin { display: none !important; }\n'
-        if (theaterMode) css += [
-            '.header__nav', '#user-profiles-menu-trigger', '#kids-access-button', 'footer',
-            '.video__metadata', 'div.top-menu-hint', '.top-menu-backplane', '.controls-backplane'
-        ].join(', ') + ' { display: none !important; }\n'
+        if (theaterMode) {
+            css += [
+                '.header__nav', 'header nav', '#user-profiles-menu-trigger', '#kids-access-button', 'footer',
+                '.video__metadata', 'div.top-menu-hint', '.top-menu-backplane', '.controls-backplane',
+                '.aa-player-skin [class*="live-badge"]', '.aa-player-skin [class*="live-indicator"]'
+            ].join(', ') + ' { display: none !important; }\n'
+            // lock the page so scrolling can't reveal the footer
+            css += 'html, body { overflow: hidden !important; }\n'
+        }
         if (enablePanel || showAudioControls) css += [
             '#bblf-panel { position:absolute; top:0; right:0; bottom:0; width:' + panelWidth + 'px; z-index:2147483646;',
             '  display:none; flex-direction:column; background:rgba(28,28,30,0.72);',
@@ -537,16 +547,16 @@ v 1.2
             '  border:0.5px solid rgba(255,255,255,0.14); color:#fff; pointer-events:none; opacity:0;',
             '  font:600 12.5px -apple-system,BlinkMacSystemFont,sans-serif; transition:opacity 0.25s; box-shadow:0 4px 14px rgba(0,0,0,0.4); }',
             '#bblf-transport { position:absolute; bottom:80px; left:50%; transform:translateX(-50%); z-index:2147483646;',
-            '  display:flex; align-items:center; gap:2px; padding:6px 10px; border-radius:14px; background:rgba(28,28,30,0.72);',
+            '  display:flex; align-items:center; gap:6px; padding:8px 14px; border-radius:16px; background:rgba(28,28,30,0.72);',
             '  backdrop-filter:blur(30px) saturate(180%); -webkit-backdrop-filter:blur(30px) saturate(180%);',
             '  border:0.5px solid rgba(255,255,255,0.12); box-shadow:0 4px 14px rgba(0,0,0,0.4); }',
-            '.bblf-tbtn { background:none; border:none; color:rgba(255,255,255,0.75); cursor:pointer; padding:4px 8px;',
+            '.bblf-tbtn { background:none; border:none; color:rgba(255,255,255,0.75); cursor:pointer; padding:6px 10px;',
             '  border-radius:8px; line-height:1; font:600 15px -apple-system,BlinkMacSystemFont,sans-serif; }',
             '.bblf-tbtn:hover { color:#fff; background:rgba(118,118,128,0.24); }',
             '#bblf-t-play { min-width:32px; text-align:center; }',
-            '.bblf-tsep { width:0.5px; height:18px; background:rgba(255,255,255,0.16); margin:0 6px; }',
-            '#bblf-live-pill { display:flex; align-items:center; gap:6px; border:0.5px solid transparent; cursor:pointer; padding:4px 10px;',
-            '  margin-left:6px; border-radius:12px; background:transparent; color:rgba(255,255,255,0.85);',
+            '.bblf-tsep { width:0.5px; height:18px; background:rgba(255,255,255,0.16); margin:0 10px; }',
+            '#bblf-live-pill { display:flex; align-items:center; gap:6px; border:0.5px solid transparent; cursor:pointer; padding:5px 12px;',
+            '  margin-left:8px; border-radius:12px; background:transparent; color:rgba(255,255,255,0.85);',
             '  font:700 11px -apple-system,BlinkMacSystemFont,sans-serif; letter-spacing:0.5px; }',
             '#bblf-live-pill.bblf-behind { background:rgba(255,69,58,0.18); border-color:rgba(255,69,58,0.5); color:#fff; }',
             '#bblf-live-pill:hover { background:rgba(118,118,128,0.3); }',
