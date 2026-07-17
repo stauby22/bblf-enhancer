@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BBLF Enhancer
 // @namespace    http://tampermonkey.net/
-// @version      1.8
+// @version      1.8.1
 // @description  Monitor for issues on Big Brother Live Feed streams, reloading or starting video when necessary. Can autoload quad cam, add hotkeys, show video scrubber, and remap fullscreen button to only show video.
 // @author       liquid8d
 // @match        https://www.paramountplus.com/live-tv/stream/big_brother/*
@@ -13,6 +13,12 @@
 
 // ==/UserScript==
 /*
+v 1.8.1 (2026)
+ - parse the post-eviction sticky format: bullet-less lines, >!spoiler!< values,
+   Evicted (with vote count) and BBB keys
+ - evictions persist in localStorage so the wall remembers them on future days
+ - BBB chip (blue), Evicted line in the summary strip
+ - unescape HTML entities in comment bodies (&gt; etc.)
 v 1.8 (2026)
  - iOS-style skin from the design mock: translucent material panel, segmented control
    with sliding thumb, system colors (#30d158/#ff453a/#ffd60a), crown + chip badges,
@@ -144,12 +150,15 @@ v 1.2
     // portraits live in the repo (assets/cast/bb28); update folder + list each season
     const castImageBase = 'https://raw.githubusercontent.com/stauby22/bblf-enhancer/phase0/assets/cast/bb28/'
     const HOUSEGUESTS = ['Angela', 'Ashley', 'Barrett', 'Chuk', 'Dee', 'Drew', 'Haley', 'Jason', 'Kamu', 'Latrice', 'Lyric', 'Mallory', 'Melody', 'Rick', 'Rome', 'Taylor', 'Yash']
-    // the sticky doesn't track evictions - list names here to gray them out
+    // manual extra evictions (the parser also auto-remembers evictions from stickies in localStorage)
     const evictedHouseguests = []
+    // localStorage key where auto-detected evictions accumulate (clear it or bump per season)
+    const evictedStoreKey = 'bblf_evicted_bb28'
     // manual override for the house state; null = use the parsed reddit sticky. shape matches the parser output:
     // { day: 7, hoh: [{name:'Dee'}], noms: [{name:'Ashley'}, {name:'Mallory', struck:true}],
     //   vetoPlayers: [{name:'Barrett'}], pov: {name:'Mallory', note:'used on herself'},
-    //   haveNots: [{name:'Chuk'}], extras: [{label:'HOH Music', value:'Chris Stapleton'}] }
+    //   haveNots: [{name:'Chuk'}], evicted: [{name:'Ashley', note:'14-0'}], bbb: {name:'Yash'},
+    //   extras: [{label:'HOH Music', value:'Chris Stapleton'}] }
     const manualHouseState = null
     // autostart video when page is loaded
     const forcePlay = true
@@ -780,6 +789,7 @@ v 1.2
         if (sticky && sticky.body !== houseStickyBody) {
             houseStickyBody = sticky.body
             houseState = parseHouseSticky(sticky.body)
+            if (houseState && houseState.evicted.length) rememberEvicted(houseState.evicted)
             log('house sticky ' + (houseState ? 'parsed (day ' + houseState.day + ')' : 'found but not parseable'))
             if (panelTab === 'house') renderHouse()
         }
@@ -828,7 +838,7 @@ v 1.2
         meta.appendChild(score)
         const body = document.createElement('div')
         body.className = 'bblf-c-body'
-        body.textContent = c.body
+        body.textContent = unescapeHtml(c.body)
         el.appendChild(meta)
         el.appendChild(body)
         return el
@@ -856,19 +866,24 @@ v 1.2
         if (t === 'house') renderHouse()
     }
 
-    // parse the mod sticky, e.g.:
-    // **Day 7**
-    // * **HOH**: Dee
-    // * **Noms**: Ashley, ~~Mallory~~, Taylor, Yash
-    // * **POV**: Mallory (used on herself)
+    // parse the mod sticky. mid-week format:
+    //   **Day 7**
+    //   * **HOH**: Dee
+    //   * **Noms**: Ashley, ~~Mallory~~, Taylor, Yash
+    //   * **POV**: Mallory (used on herself)
+    // post-eviction format (no bullets, spoiler-tagged values):
+    //   **Day 10**
+    //   **BBB**: >!Yash!<
+    //   **Evicted**: >!Ashley (14-0)!<
     function parseHouseSticky(body) {
         try {
-            const state = { day: null, hoh: [], noms: [], vetoPlayers: [], pov: null, haveNots: [], extras: [] }
+            body = unescapeHtml(body).replace(/>!/g, '').replace(/!</g, '')
+            const state = { day: null, hoh: [], noms: [], vetoPlayers: [], pov: null, haveNots: [], evicted: [], bbb: null, extras: [] }
             const dayM = body.match(/\*\*Day\s+(\d+)\*\*/i)
             if (dayM) state.day = parseInt(dayM[1])
             const lines = body.split('\n')
             for (var i = 0; i < lines.length; i++) {
-                const m = lines[i].match(/^\s*[*-]\s+\*\*(.+?)\*\*\s*:\s*(.+?)\s*$/)
+                const m = lines[i].match(/^\s*(?:[*-]\s+)?\*\*(.+?)\*\*\s*:\s*(.+?)\s*$/)
                 if (!m) continue
                 const key = m[1].trim().toLowerCase()
                 const names = m[2].split(',').map(function(s) {
@@ -883,14 +898,39 @@ v 1.2
                 else if (key === 'veto players') state.vetoPlayers = names
                 else if (key === 'pov' || key === 'veto' || key === 'veto winner') state.pov = names[0] || null
                 else if (key === 'have nots' || key === 'have-nots' || key === 'havenots') state.haveNots = names
+                else if (key === 'evicted') state.evicted = names
+                else if (key === 'bbb' || key === 'block buster' || key === 'blockbuster') state.bbb = names[0] || null
                 else state.extras.push({ label: m[1].trim(), value: m[2].trim() })
             }
             // require at least one game field so random bold lists don't count as a parse
-            if (!state.hoh.length && !state.noms.length && !state.haveNots.length && !state.pov) return null
+            if (!state.hoh.length && !state.noms.length && !state.haveNots.length && !state.pov && !state.evicted.length && !state.bbb) return null
             return state
         } catch (e) {
             return null
         }
+    }
+
+    // reddit JSON bodies arrive HTML-entity-escaped
+    function unescapeHtml(s) {
+        return s.replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#x27;/g, "'").replace(/&amp;/g, '&')
+    }
+
+    // evictions accumulate in localStorage so the wall remembers them after the sticky moves on
+    function rememberEvicted(list) {
+        try {
+            const cur = JSON.parse(localStorage.getItem(evictedStoreKey) || '[]')
+            list.forEach(function(n) {
+                const name = String(n.name || n)
+                if (name && !cur.some(function(x) { return x.toLowerCase() === name.toLowerCase() })) cur.push(name)
+            })
+            localStorage.setItem(evictedStoreKey, JSON.stringify(cur))
+        } catch (e) {}
+    }
+
+    function isEvicted(name) {
+        var stored = []
+        try { stored = JSON.parse(localStorage.getItem(evictedStoreKey) || '[]') } catch (e) {}
+        return evictedHouseguests.concat(stored).some(function(n) { return n.toLowerCase() === name.toLowerCase() })
     }
 
     function getHouseState() {
@@ -912,7 +952,8 @@ v 1.2
         day.textContent = (state && state.day) ? 'Day ' + state.day : 'House'
         const remaining = document.createElement('div')
         remaining.style.cssText = 'font-size:12px;color:rgba(235,235,245,0.42);'
-        remaining.textContent = (HOUSEGUESTS.length - evictedHouseguests.length) + ' remaining'
+        const evictedCount = HOUSEGUESTS.filter(function(n) { return isEvicted(n) }).length
+        remaining.textContent = (HOUSEGUESTS.length - evictedCount) + ' remaining'
         dayRow.appendChild(day)
         dayRow.appendChild(remaining)
         head.appendChild(dayRow)
@@ -934,6 +975,8 @@ v 1.2
             const liveNoms = state.noms.filter(function(n) { return !n.struck })
             if (liveNoms.length) addPart('Noms', '#ff453a', liveNoms.map(function(n) { return n.name }).join(', '))
             if (state.pov) addPart('POV', '#30d158', state.pov.name + (state.pov.note ? ' (' + state.pov.note + ')' : ''))
+            if (state.bbb) addPart('BBB', '#0a84ff', state.bbb.name)
+            if (state.evicted.length) addPart('Evicted', '#8e8e93', state.evicted.map(function(n) { return n.name + (n.note ? ' (' + n.note + ')' : '') }).join(', '))
             if (first) summary.textContent = 'no game info parsed yet'
         } else {
             summary.textContent = houseStickyBody
@@ -969,7 +1012,7 @@ v 1.2
         const s = { crown: false, ring: null, chip: null, dim: false, struck: false }
         const eq = function(n) { return n && n.name && n.name.toLowerCase() === name.toLowerCase() }
         const gray = 'rgba(120,120,128,0.55)'
-        if (evictedHouseguests.some(function(n) { return n.toLowerCase() === name.toLowerCase() })) {
+        if (isEvicted(name)) {
             s.dim = true
             s.chip = { text: 'OUT', bg: 'rgba(90,90,95,0.55)', color: '#fff' }
             return s
@@ -989,6 +1032,10 @@ v 1.2
         if (isPov) {
             s.ring = s.ring || '#30d158'
             if (!s.chip) s.chip = { text: 'V · POV', bg: '#30d158', color: '#00350f' }
+        }
+        if (state.bbb && eq(state.bbb)) {
+            s.ring = s.ring || '#0a84ff'
+            if (!s.chip) s.chip = { text: 'BBB', bg: '#0a84ff', color: '#fff' }
         }
         if (!s.chip && state.haveNots.some(eq)) s.chip = { text: 'HAVE-NOT', bg: gray, color: '#fff' }
         return s
