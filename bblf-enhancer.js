@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BBLF Enhancer
 // @namespace    http://tampermonkey.net/
-// @version      1.11
+// @version      1.12
 // @description  Monitor for issues on Big Brother Live Feed streams, reloading or starting video when necessary. Can autoload quad cam, add hotkeys, show video scrubber, and remap fullscreen button to only show video.
 // @author       liquid8d
 // @match        https://www.paramountplus.com/live-tv/stream/big_brother/*
@@ -10,9 +10,15 @@
 // @grant        GM_xmlhttpRequest
 // @connect      reddit.com
 // @connect      www.reddit.com
+// @connect      feedbot.liquid8d.dev
 
 // ==/UserScript==
 /*
+v 1.12 (2026)
+ - feed status in the transport bar via FeedBot (feedbot.liquid8d.dev):
+   colored dot + 'up · 2h 14m' / 'fish · 3m' / 'down · 12m', polled every 60s
+ - tooltip shows recent state changes and, when feeds aren't up, the
+   typical outage schedule
 v 1.11 (2026)
  - audio controls (L/C/R pan + gain boost) moved from the top bar into the transport bar
  - P+ LIVE badge hidden by text match (no stable class); logs the class it finds
@@ -185,6 +191,12 @@ v 1.2
     const seekLarge = 300
     // stay this far behind the live edge when going live, avoids stalls (BBViewer used 2)
     const liveEdgeMargin = 2
+    // --- feed status (FeedBot) ---
+    // show BB feed up/down status from feedbot.liquid8d.dev in the transport bar
+    const enableFeedStatus = true
+    const feedbotSeason = 'bb28'
+    // how often to poll feedbot (secs * ms)
+    const feedbotInterval = 60 * 1000
     // show the transport bar (apple-music style) over the video
     const showTransportBar = true
     // --- cast wall (House tab) ---
@@ -285,6 +297,12 @@ v 1.2
         setInterval(() => {
             checkVideo();
         }, monitorInterval);
+
+        // feed status from feedbot
+        if (enableFeedStatus) {
+            refreshFeedStatus()
+            setInterval(refreshFeedStatus, feedbotInterval)
+        }
     }
 
 	function getCamera() {
@@ -732,6 +750,27 @@ v 1.2
                 b.onclick = fn
                 return b
             }
+            if (enableFeedStatus) {
+                const feeds = document.createElement('div')
+                feeds.id = 'bblf-feeds'
+                feeds.title = 'BB feed status via FeedBot'
+                feeds.style.cssText = 'display:flex;align-items:center;gap:6px;padding:0 4px;' +
+                    'font:600 11px -apple-system,BlinkMacSystemFont,sans-serif;color:rgba(235,235,245,0.7);letter-spacing:0.3px;'
+                const fdot = document.createElement('span')
+                fdot.className = 'bblf-live-dot'
+                fdot.id = 'bblf-feeds-dot'
+                fdot.style.background = '#8e8e93'
+                fdot.style.boxShadow = 'none'
+                const flabel = document.createElement('span')
+                flabel.id = 'bblf-feeds-label'
+                flabel.textContent = '…'
+                feeds.appendChild(fdot)
+                feeds.appendChild(flabel)
+                bar.appendChild(feeds)
+                const sep0 = document.createElement('div')
+                sep0.className = 'bblf-tsep'
+                bar.appendChild(sep0)
+            }
             bar.appendChild(mk('«', 'back 5 min  (,)', function() { playerSkip(-seekLarge) }))
             bar.appendChild(mk('‹', 'back 30s  (←)', function() { playerSkip(-seekSmall) }))
             bar.appendChild(mk('❚❚', 'pause / play', function() { playerTogglePause() }, 'bblf-t-play'))
@@ -821,6 +860,53 @@ v 1.2
         label.textContent = atEdge ? 'LIVE' : (video.paused ? 'PAUSED' : formatSecs(behind))
         pill.className = atEdge ? '' : 'bblf-behind'
         if (dot) dot.style.opacity = atEdge ? '1' : '0.35'
+    }
+
+    // --- feed status (FeedBot: feedbot.liquid8d.dev / @feed-bot.bsky.social) ---
+
+    async function refreshFeedStatus() {
+        try {
+            const d = await gmFetchJson('https://feedbot.liquid8d.dev/assets/' + feedbotSeason + '/latest.json')
+            var events = []
+            try {
+                const h = await gmFetchJson('https://feedbot.liquid8d.dev/api/images?season=' + feedbotSeason + '&state_changes=true&limit=4')
+                events = h.events || []
+            } catch (e) { /* history is optional */ }
+            renderFeedStatus(d, events)
+        } catch (e) {
+            const label = document.getElementById('bblf-feeds-label')
+            if (label) label.textContent = '—'
+        }
+    }
+
+    function renderFeedStatus(d, events) {
+        const dot = document.getElementById('bblf-feeds-dot')
+        const label = document.getElementById('bblf-feeds-label')
+        const wrap = document.getElementById('bblf-feeds')
+        if (!dot || !label || !wrap) return
+        const colors = { up: '#30d158', fish: '#ff9f0a', pets: '#ff9f0a', down: '#ff453a' }
+        const color = colors[d.status] || '#8e8e93'
+        dot.style.background = color
+        dot.style.boxShadow = (d.status === 'up') ? '0 0 8px ' + color : 'none'
+        const dur = formatDuration(Math.max(0, Math.floor(Date.now() / 1000) - d.since))
+        label.textContent = (d.status === 'up' ? 'up' : d.status) + ' · ' + dur
+        var tip = 'BB feeds ' + (d.status === 'up' ? 'live' : d.status) + ' for ' + dur + '  (via FeedBot)'
+        if (events && events.length) {
+            tip += '\nrecent: ' + events.map(function(ev) {
+                return ev.state + ' ' + formatDuration(Math.max(0, Math.floor(Date.now() / 1000) - parseInt(ev.ts))) + ' ago'
+            }).join(' · ')
+        }
+        if (d.status !== 'up') {
+            tip += '\ntypical outages: Mon veto ~11am · Thu lockdown 11am/2pm · Fri noms ~3pm · Sat veto comp ~12pm'
+        }
+        wrap.title = tip
+    }
+
+    function formatDuration(s) {
+        if (s < 60) return s + 's'
+        const m = Math.floor(s / 60)
+        if (m < 60) return m + 'm'
+        return Math.floor(m / 60) + 'h ' + (m % 60) + 'm'
     }
 
     // --- sidebar panel + reddit feed discussion reader ---
