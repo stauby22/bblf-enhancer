@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BBLF Enhancer
 // @namespace    http://tampermonkey.net/
-// @version      1.8.1
+// @version      1.9
 // @description  Monitor for issues on Big Brother Live Feed streams, reloading or starting video when necessary. Can autoload quad cam, add hotkeys, show video scrubber, and remap fullscreen button to only show video.
 // @author       liquid8d
 // @match        https://www.paramountplus.com/live-tv/stream/big_brother/*
@@ -13,6 +13,12 @@
 
 // ==/UserScript==
 /*
+v 1.9 (2026)
+ - transport controls (buffer-seek logic from the BBViewer extension, 2s live-edge margin):
+   ArrowLeft/Right skip 30s, ',' '.' skip 5min, 'l' go live, 'p' picture-in-picture
+ - seek toast shows the jump + how far behind live you are
+ - 'behind live' chip (bottom left) whenever you're off the live edge - click to snap back
+ - hotkeys now preventDefault (arrows no longer scroll the page)
 v 1.8.1 (2026)
  - parse the post-eviction sticky format: bullet-less lines, >!spoiler!< values,
    Evicted (with vote count) and BBB keys
@@ -97,7 +103,13 @@ v 1.2
         { key: 'f', action: function() { toggleFullscreen() } },
         { key: '[', action: function() { setGainBoost(gainBoost - 0.25) } },
         { key: ']', action: function() { setGainBoost(gainBoost + 0.25) } },
-        { key: 'r', action: function() { togglePanel() } }
+        { key: 'r', action: function() { togglePanel() } },
+        { key: 'ArrowLeft', action: function() { playerSkip(-seekSmall) } },
+        { key: 'ArrowRight', action: function() { playerSkip(seekSmall) } },
+        { key: ',', action: function() { playerSkip(-seekLarge) } },
+        { key: '.', action: function() { playerSkip(seekLarge) } },
+        { key: 'l', action: function() { playerGoLive() } },
+        { key: 'p', action: function() { playerPip() } }
     ]
 
     // force allow up to 1080p resolution
@@ -146,6 +158,14 @@ v 1.2
     const redditCommentLimit = 75
     // panel width in px
     const panelWidth = 360
+    // --- player transport controls ---
+    // rewind/forward within the buffer, go-live, picture-in-picture
+    const enablePlayerControls = true
+    // arrow key skip (secs) and ',' '.' skip (secs)
+    const seekSmall = 30
+    const seekLarge = 300
+    // stay this far behind the live edge when going live, avoids stalls (BBViewer used 2)
+    const liveEdgeMargin = 2
     // --- cast wall (House tab) ---
     // portraits live in the repo (assets/cast/bb28); update folder + list each season
     const castImageBase = 'https://raw.githubusercontent.com/stauby22/bblf-enhancer/phase0/assets/cast/bb28/'
@@ -203,6 +223,7 @@ v 1.2
     let panelTab = 'feed';
     let houseState = null;
     let houseStickyBody = null;
+    let toastTimer = null;
 
     if (localStorage.getItem('bblf_video_monitor_attempts')) attempts = (resetScript) ? 0 : parseInt(localStorage.getItem('bblf_video_monitor_attempts'))
 
@@ -227,7 +248,10 @@ v 1.2
                 if (e.ctrlKey || e.metaKey || e.altKey) return
                 for (var i = 0; i < hotkeys.length; i++) {
                     const hotkey = hotkeys[i].key.toString()
-                    if (e.key === hotkey || e.code === hotkey) hotkeys[i].action()
+                    if (e.key === hotkey || e.code === hotkey) {
+                        e.preventDefault()
+                        hotkeys[i].action()
+                    }
                 }
             }
             log('hotkeys enabled')
@@ -350,6 +374,7 @@ v 1.2
 						ensureStyles()
 						if (showAudioControls) ensureAudioBar()
 						if (enablePanel) ensurePanel()
+						if (enablePlayerControls) updateLiveChip()
 						if (enableFullscreenHotkey && !fsDefused) defuseSmartTagFullscreen()
 						if (qualityFix) updateQualities()
 						if (removeControls && !controlsRemoved) {
@@ -492,7 +517,18 @@ v 1.2
             '  font-size:9.5px; font-weight:700; letter-spacing:0.4px; white-space:nowrap; box-shadow:0 1px 2px rgba(0,0,0,0.45); }',
             '.bblf-card { display:flex; flex-direction:column; align-items:center; gap:10px; }',
             '.bblf-card-name { font-size:12.5px; font-weight:500; text-align:center; color:rgba(255,255,255,0.92); }',
-            '#bblf-audio-bar input[type=range] { accent-color:#30d158; }'
+            '#bblf-audio-bar input[type=range] { accent-color:#30d158; }',
+            '#bblf-seek-toast { position:absolute; bottom:96px; left:50%; transform:translateX(-50%); z-index:2147483647;',
+            '  display:none; padding:6px 14px; border-radius:16px; background:rgba(28,28,30,0.72);',
+            '  backdrop-filter:blur(30px) saturate(180%); -webkit-backdrop-filter:blur(30px) saturate(180%);',
+            '  border:0.5px solid rgba(255,255,255,0.14); color:#fff; pointer-events:none; opacity:0;',
+            '  font:600 12.5px -apple-system,BlinkMacSystemFont,sans-serif; transition:opacity 0.25s; box-shadow:0 4px 14px rgba(0,0,0,0.4); }',
+            '#bblf-live-chip { position:absolute; bottom:96px; left:22px; z-index:2147483647; display:none; align-items:center; gap:6px;',
+            '  padding:6px 12px; border-radius:16px; border:0.5px solid rgba(255,255,255,0.14); background:rgba(28,28,30,0.72);',
+            '  backdrop-filter:blur(30px) saturate(180%); -webkit-backdrop-filter:blur(30px) saturate(180%);',
+            '  color:#fff; font:600 12px -apple-system,BlinkMacSystemFont,sans-serif; cursor:pointer; box-shadow:0 4px 14px rgba(0,0,0,0.4); }',
+            '#bblf-live-chip:hover { background:rgba(44,44,46,0.88); }',
+            '.bblf-live-dot { width:7px; height:7px; border-radius:50%; background:#ff453a; box-shadow:0 0 8px #ff453a; display:inline-block; }'
         ].join('\n') + '\n'
         if (!css) return
         const style = document.createElement('style')
@@ -578,6 +614,130 @@ v 1.2
         skin.appendChild(bar)
         updatePanUI()
         log('audio bar added')
+    }
+
+    // --- player transport controls (buffer-seek logic ported from the BBViewer extension) ---
+
+    function getVideoEl() {
+        return document.querySelector('.aa-player-skin .player-wrapper video') || document.querySelector('video')
+    }
+
+    // the buffered range we're currently inside (P+ live duration/seekable are unreliable; the
+    // extension seeks against video.buffered for this site, so we do too)
+    function bufferedRange(video) {
+        const b = video.buffered
+        if (!b || b.length === 0) return null
+        for (var i = 0; i < b.length; i++) {
+            if (video.currentTime >= b.start(i) && video.currentTime <= b.end(i)) {
+                return { start: b.start(i), end: b.end(i) }
+            }
+        }
+        return { start: b.start(b.length - 1), end: b.end(b.length - 1) }
+    }
+
+    function playerSkip(secs) {
+        if (!enablePlayerControls) return
+        const video = getVideoEl()
+        if (!video) return
+        const range = bufferedRange(video)
+        if (!range) { showSeekToast('nothing buffered yet'); return }
+        const liveEdge = Math.floor(range.end) - liveEdgeMargin
+        const floor = Math.floor(range.start)
+        var target = Math.floor(video.currentTime) + secs
+        if (target > liveEdge) target = liveEdge
+        if (target < floor) target = floor
+        video.currentTime = target
+        log('skip ' + secs + 's -> ' + target + ' (buffer ' + floor + '..' + liveEdge + ')')
+        const behind = liveEdge - target
+        showSeekToast((secs < 0 ? '− ' : '+ ') + formatSecs(Math.abs(secs)) +
+            (behind > liveEdgeMargin + 2 ? '  ·  ' + formatSecs(behind) + ' behind' : '  ·  live'))
+        updateLiveChip()
+    }
+
+    function playerGoLive() {
+        if (!enablePlayerControls) return
+        const video = getVideoEl()
+        if (!video) return
+        if (video.paused) video.play()
+        const range = bufferedRange(video)
+        if (range) video.currentTime = Math.floor(range.end) - liveEdgeMargin
+        log('go live')
+        showSeekToast('● LIVE')
+        updateLiveChip()
+    }
+
+    function playerPip() {
+        if (!enablePlayerControls) return
+        const video = getVideoEl()
+        if (!video) return
+        try {
+            if (document.pictureInPictureElement) document.exitPictureInPicture()
+            else video.requestPictureInPicture()
+        } catch (e) {
+            warn('pip failed: ' + e)
+        }
+    }
+
+    function formatSecs(s) {
+        s = Math.max(0, Math.round(s))
+        const m = Math.floor(s / 60)
+        return m > 0 ? m + ':' + String(s % 60).padStart(2, '0') : s + 's'
+    }
+
+    function ensureTransportUi() {
+        const skin = document.querySelector('.aa-player-skin')
+        if (!skin) return null
+        if (getComputedStyle(skin).position === 'static') skin.style.position = 'relative'
+        var toast = document.getElementById('bblf-seek-toast')
+        if (!toast) {
+            toast = document.createElement('div')
+            toast.id = 'bblf-seek-toast'
+            skin.appendChild(toast)
+        }
+        var chip = document.getElementById('bblf-live-chip')
+        if (!chip) {
+            chip = document.createElement('button')
+            chip.id = 'bblf-live-chip'
+            chip.title = 'jump back to live'
+            const dot = document.createElement('span')
+            dot.className = 'bblf-live-dot'
+            const label = document.createElement('span')
+            label.id = 'bblf-live-chip-label'
+            chip.appendChild(dot)
+            chip.appendChild(label)
+            chip.onclick = function() { playerGoLive() }
+            skin.appendChild(chip)
+        }
+        return { toast: toast, chip: chip }
+    }
+
+    function showSeekToast(text) {
+        const ui = ensureTransportUi()
+        if (!ui) return
+        ui.toast.textContent = text
+        ui.toast.style.display = 'block'
+        ui.toast.style.opacity = '1'
+        if (toastTimer) clearTimeout(toastTimer)
+        toastTimer = setTimeout(function() {
+            ui.toast.style.opacity = '0'
+            setTimeout(function() { ui.toast.style.display = 'none' }, 250)
+        }, 1200)
+    }
+
+    function updateLiveChip() {
+        const ui = ensureTransportUi()
+        if (!ui) return
+        const video = getVideoEl()
+        const range = video ? bufferedRange(video) : null
+        if (!video || !range) { ui.chip.style.display = 'none'; return }
+        const behind = Math.floor(range.end) - liveEdgeMargin - Math.floor(video.currentTime)
+        const label = document.getElementById('bblf-live-chip-label')
+        if (video.paused || behind > liveEdgeMargin + 3) {
+            if (label) label.textContent = (video.paused ? 'paused' : formatSecs(behind) + ' behind') + '  ·  go live'
+            ui.chip.style.display = 'flex'
+        } else {
+            ui.chip.style.display = 'none'
+        }
     }
 
     // --- sidebar panel + reddit feed discussion reader ---
@@ -696,6 +856,8 @@ v 1.2
         // keep the audio bar centered over the (possibly narrowed) video
         const bar = document.getElementById('bblf-audio-bar')
         if (bar) bar.style.left = panelOpen ? 'calc(50% - ' + (panelWidth / 2) + 'px)' : '50%'
+        const toast = document.getElementById('bblf-seek-toast')
+        if (toast) toast.style.left = panelOpen ? 'calc(50% - ' + (panelWidth / 2) + 'px)' : '50%'
         if (panelOpen) redditStart()
         else redditStop()
     }
