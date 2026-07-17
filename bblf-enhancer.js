@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BBLF Enhancer
 // @namespace    http://tampermonkey.net/
-// @version      1.9
+// @version      1.9.1
 // @description  Monitor for issues on Big Brother Live Feed streams, reloading or starting video when necessary. Can autoload quad cam, add hotkeys, show video scrubber, and remap fullscreen button to only show video.
 // @author       liquid8d
 // @match        https://www.paramountplus.com/live-tv/stream/big_brother/*
@@ -13,6 +13,10 @@
 
 // ==/UserScript==
 /*
+v 1.9.1 (2026)
+ - seek into the stream's DVR window (video.seekable) when it reaches further back
+   than the session buffer - rewind can now go beyond the last reload if P+ keeps one
+ - preferSeekableRange config to force buffer-only seeking if the DVR path misbehaves
 v 1.9 (2026)
  - transport controls (buffer-seek logic from the BBViewer extension, 2s live-edge margin):
    ArrowLeft/Right skip 30s, ',' '.' skip 5min, 'l' go live, 'p' picture-in-picture
@@ -166,6 +170,9 @@ v 1.2
     const seekLarge = 300
     // stay this far behind the live edge when going live, avoids stalls (BBViewer used 2)
     const liveEdgeMargin = 2
+    // if the stream exposes a DVR window (video.seekable) reaching further back than the
+    // session buffer, allow seeking into it; set false to only ever seek the buffer
+    const preferSeekableRange = true
     // --- cast wall (House tab) ---
     // portraits live in the repo (assets/cast/bb28); update folder + list each season
     const castImageBase = 'https://raw.githubusercontent.com/stauby22/bblf-enhancer/phase0/assets/cast/bb28/'
@@ -224,6 +231,7 @@ v 1.2
     let houseState = null;
     let houseStickyBody = null;
     let toastTimer = null;
+    let seekableLogged = false;
 
     if (localStorage.getItem('bblf_video_monitor_attempts')) attempts = (resetScript) ? 0 : parseInt(localStorage.getItem('bblf_video_monitor_attempts'))
 
@@ -635,11 +643,34 @@ v 1.2
         return { start: b.start(b.length - 1), end: b.end(b.length - 1) }
     }
 
+    // widest safe seek window: the DVR/seekable range when it reaches further back
+    // than the session buffer, otherwise the buffer itself
+    function seekBounds(video) {
+        const buf = bufferedRange(video)
+        var start = buf ? buf.start : null
+        var end = buf ? buf.end : null
+        if (preferSeekableRange && video.seekable && video.seekable.length > 0) {
+            const ss = video.seekable.start(0)
+            const se = video.seekable.end(video.seekable.length - 1)
+            if (start === null || ss < start - 5) {
+                if (!seekableLogged) {
+                    seekableLogged = true
+                    log('DVR window detected: seekable ' + Math.floor(ss) + '..' + Math.floor(se) +
+                        (buf ? ' vs buffer ' + Math.floor(buf.start) + '..' + Math.floor(buf.end) : ' (no buffer info)'))
+                }
+                start = ss
+                end = (end === null) ? se : Math.max(end, se)
+            }
+        }
+        if (start === null) return null
+        return { start: start, end: end }
+    }
+
     function playerSkip(secs) {
         if (!enablePlayerControls) return
         const video = getVideoEl()
         if (!video) return
-        const range = bufferedRange(video)
+        const range = seekBounds(video)
         if (!range) { showSeekToast('nothing buffered yet'); return }
         const liveEdge = Math.floor(range.end) - liveEdgeMargin
         const floor = Math.floor(range.start)
@@ -659,7 +690,7 @@ v 1.2
         const video = getVideoEl()
         if (!video) return
         if (video.paused) video.play()
-        const range = bufferedRange(video)
+        const range = seekBounds(video)
         if (range) video.currentTime = Math.floor(range.end) - liveEdgeMargin
         log('go live')
         showSeekToast('● LIVE')
@@ -728,7 +759,7 @@ v 1.2
         const ui = ensureTransportUi()
         if (!ui) return
         const video = getVideoEl()
-        const range = video ? bufferedRange(video) : null
+        const range = video ? seekBounds(video) : null
         if (!video || !range) { ui.chip.style.display = 'none'; return }
         const behind = Math.floor(range.end) - liveEdgeMargin - Math.floor(video.currentTime)
         const label = document.getElementById('bblf-live-chip-label')
