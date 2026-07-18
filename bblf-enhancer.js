@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BBLF Enhancer
 // @namespace    http://tampermonkey.net/
-// @version      1.12
+// @version      1.13
 // @description  Monitor for issues on Big Brother Live Feed streams, reloading or starting video when necessary. Can autoload quad cam, add hotkeys, show video scrubber, and remap fullscreen button to only show video.
 // @author       liquid8d
 // @match        https://www.paramountplus.com/live-tv/stream/big_brother/*
@@ -14,6 +14,11 @@
 
 // ==/UserScript==
 /*
+v 1.13 (2026)
+ - Settings tab: reddit refresh rate (15-60s), stream quality, theater mode,
+   guide hiding, transport bar, audio controls, feed status - all persisted in
+   localStorage so they survive script updates; Reset button restores defaults
+ - reddit 429 backoff: rate-limit responses pause polling for 2 minutes
 v 1.12 (2026)
  - feed status in the transport bar via FeedBot (feedbot.liquid8d.dev):
    colored dot + 'up · 2h 14m' / 'fish · 3m' / 'down · 12m', polled every 60s
@@ -226,6 +231,19 @@ v 1.2
     // reset the 'retry' attempts in the script, if it is no longer working
     const resetScript = false
 
+    // --- settings (Settings tab) ---
+    // the consts above are defaults; anything changed in the panel's Settings tab is
+    // stored in localStorage ('bblf_settings') and survives script updates
+    const SETTINGS_DEFAULTS = {
+        redditInterval: redditCommentInterval / 1000,
+        preferredQuality: preferredQuality,
+        theaterMode: theaterMode,
+        hideGuideOverlay: hideGuideOverlay,
+        showTransportBar: showTransportBar,
+        showAudioControls: showAudioControls,
+        enableFeedStatus: enableFeedStatus
+    }
+
     // DO NOT MODIFY AFTER HERE
 
     // current camera (only modified to verify quad cam switch)
@@ -260,6 +278,9 @@ v 1.2
     let houseStickyBody = null;
     let toastTimer = null;
     let userPaused = false;
+    let redditCooldownUntil = 0;
+    var settingsStore = {}
+    try { settingsStore = JSON.parse(localStorage.getItem('bblf_settings') || '{}') } catch (e) {}
 
     if (localStorage.getItem('bblf_video_monitor_attempts')) attempts = (resetScript) ? 0 : parseInt(localStorage.getItem('bblf_video_monitor_attempts'))
 
@@ -325,15 +346,16 @@ v 1.2
 			playback.maxBitrate = 8128372
 			playback.refreshQualities()
 		}
-		if (preferredQuality == 'AUTO') {
+		const wantQuality = getSetting('preferredQuality')
+		if (wantQuality == 'AUTO') {
 			if (!player.autoQualitySwitching) {
 				player.autoQualitySwitching = true
 				playback.refreshQualities()
 			}
-		} else if (player.qualityCategory != preferredQuality) {
-			log('setting quality category to ' + preferredQuality)
+		} else if (player.qualityCategory != wantQuality) {
+			log('setting quality category to ' + wantQuality)
 			player.autoQualitySwitching = false
-			player.qualityCategory = preferredQuality
+			player.qualityCategory = wantQuality
 		}
     }
 
@@ -415,7 +437,7 @@ v 1.2
 						if (audioCtx.state === 'suspended') audioCtx.resume()
 						ensureStyles()
 						if (enablePanel) ensurePanel()
-						if (theaterMode) hidePlusLiveBadge()
+						if (getSetting('theaterMode')) hidePlusLiveBadge()
 						if (enablePlayerControls) updateTransportBar()
 						if (enableFullscreenHotkey && !fsDefused) defuseSmartTagFullscreen()
 						if (qualityFix) updateQualities()
@@ -526,8 +548,8 @@ v 1.2
         // .live-schedule .channels-container is the (BB28) hover channel guide list; hiding all of
         // .live-schedule also killed the player top bar (menu/cast/captions), so only hide the list.
         // .skin-sidebar-plugin was the older guide from the Stylebot CSS
-        if (hideGuideOverlay) css += '.live-schedule .channels-container, div.skin-sidebar-plugin { display: none !important; }\n'
-        if (theaterMode) {
+        if (getSetting('hideGuideOverlay')) css += '.live-schedule .channels-container, div.skin-sidebar-plugin { display: none !important; }\n'
+        if (getSetting('theaterMode')) {
             css += [
                 '.header__nav', 'header nav', '#user-profiles-menu-trigger', '#kids-access-button', 'footer',
                 '.video__metadata', 'div.top-menu-hint', '.top-menu-backplane', '.controls-backplane',
@@ -544,7 +566,7 @@ v 1.2
             '  font-family:-apple-system,BlinkMacSystemFont,\'SF Pro Text\',sans-serif; font-size:13px; -webkit-font-smoothing:antialiased; }',
             '#bblf-panel ::-webkit-scrollbar { width:0; height:0; }',
             '#bblf-seg { position:relative; display:flex; background:rgba(118,118,128,0.24); border-radius:9px; padding:2px; height:32px; }',
-            '#bblf-seg-thumb { position:absolute; top:2px; bottom:2px; left:2px; width:calc(50% - 2px); background:rgba(110,110,118,0.92);',
+            '#bblf-seg-thumb { position:absolute; top:2px; bottom:2px; left:2px; width:calc((100% - 4px) / 3); background:rgba(110,110,118,0.92);',
             '  border-radius:7px; box-shadow:0 1px 3px rgba(0,0,0,0.35); transition:transform 0.34s cubic-bezier(0.34,1.56,0.64,1); }',
             '.bblf-seg-btn { position:relative; z-index:1; flex:1; border:none; background:none; color:#fff; font-size:13px; font-weight:600; font-family:inherit; cursor:pointer; }',
             '.bblf-iconbtn { width:28px; height:28px; border-radius:50%; border:none; background:rgba(118,118,128,0.24); color:rgba(255,255,255,0.75);',
@@ -565,6 +587,16 @@ v 1.2
             '.bblf-card { display:flex; flex-direction:column; align-items:center; gap:10px; }',
             '.bblf-card-name { font-size:12.5px; font-weight:500; text-align:center; color:rgba(255,255,255,0.92); }',
             '#bblf-transport input[type=range] { accent-color:#30d158; }',
+            '.bblf-set-row { display:flex; align-items:center; justify-content:space-between; gap:10px; padding:12px 16px; border-bottom:0.5px solid rgba(255,255,255,0.07); }',
+            '.bblf-set-label { font-size:13px; color:rgba(255,255,255,0.9); }',
+            '.bblf-set-sub { font-size:11px; color:rgba(235,235,245,0.45); margin-top:2px; }',
+            '.bblf-switch { width:44px; height:26px; border-radius:13px; background:rgba(118,118,128,0.32); border:none; position:relative; cursor:pointer; transition:background 0.2s; flex-shrink:0; padding:0; }',
+            '.bblf-switch.on { background:#30d158; }',
+            '.bblf-knob { position:absolute; top:2px; left:2px; width:22px; height:22px; border-radius:50%; background:#fff; transition:left 0.2s; box-shadow:0 1px 3px rgba(0,0,0,0.3); }',
+            '.bblf-switch.on .bblf-knob { left:20px; }',
+            '.bblf-chips { display:flex; gap:4px; }',
+            '.bblf-chip-btn { border:none; background:rgba(118,118,128,0.24); color:rgba(255,255,255,0.8); font:600 11px -apple-system,BlinkMacSystemFont,sans-serif; padding:5px 9px; border-radius:8px; cursor:pointer; }',
+            '.bblf-chip-btn.on { background:#30d158; color:#00350f; }',
             '#bblf-seek-toast { position:absolute; bottom:140px; left:50%; transform:translateX(-50%); z-index:2147483647;',
             '  display:none; padding:6px 14px; border-radius:16px; background:rgba(28,28,30,0.72);',
             '  backdrop-filter:blur(30px) saturate(180%); -webkit-backdrop-filter:blur(30px) saturate(180%);',
@@ -626,6 +658,119 @@ v 1.2
         if (label) label.textContent = gainBoost.toFixed(2) + 'x'
         log('gain boost: ' + gainBoost)
     }
+
+    // --- settings ---
+
+    function getSetting(key) {
+        return (key in settingsStore) ? settingsStore[key] : SETTINGS_DEFAULTS[key]
+    }
+
+    function setSetting(key, value) {
+        settingsStore[key] = value
+        try { localStorage.setItem('bblf_settings', JSON.stringify(settingsStore)) } catch (e) {}
+        applySetting(key)
+        log('setting ' + key + ' = ' + value)
+    }
+
+    function applySetting(key) {
+        if (key === 'redditInterval') {
+            if (redditTimer) {
+                redditStop()
+                redditStart()
+            }
+        } else if (key === 'theaterMode' || key === 'hideGuideOverlay') {
+            const style = document.getElementById('bblf-styles')
+            if (style) style.parentNode.removeChild(style)
+            if (!getSetting('theaterMode')) {
+                document.querySelectorAll('[data-bblf-hidden]').forEach(function(el) {
+                    el.style.display = ''
+                    delete el.dataset.bblfHidden
+                })
+            }
+            ensureStyles()
+        } else if (key === 'showTransportBar' || key === 'showAudioControls' || key === 'enableFeedStatus') {
+            // drop the bar; the watchdog rebuilds it (if enabled) within 3s
+            const bar = document.getElementById('bblf-transport')
+            if (bar) bar.parentNode.removeChild(bar)
+            if (key === 'enableFeedStatus' && getSetting('enableFeedStatus')) refreshFeedStatus()
+        }
+    }
+
+    function renderSettings() {
+        const tab = document.getElementById('bblf-tab-settings')
+        if (!tab) return
+        tab.innerHTML = ''
+        const mkRow = function(label, sub, control) {
+            const row = document.createElement('div')
+            row.className = 'bblf-set-row'
+            const left = document.createElement('div')
+            const l = document.createElement('div')
+            l.className = 'bblf-set-label'
+            l.textContent = label
+            left.appendChild(l)
+            if (sub) {
+                const s = document.createElement('div')
+                s.className = 'bblf-set-sub'
+                s.textContent = sub
+                left.appendChild(s)
+            }
+            row.appendChild(left)
+            row.appendChild(control)
+            tab.appendChild(row)
+        }
+        const mkSwitch = function(key) {
+            const b = document.createElement('button')
+            b.className = 'bblf-switch' + (getSetting(key) ? ' on' : '')
+            const k = document.createElement('span')
+            k.className = 'bblf-knob'
+            b.appendChild(k)
+            b.onclick = function() {
+                setSetting(key, !getSetting(key))
+                renderSettings()
+            }
+            return b
+        }
+        const mkChips = function(key, options, fmt) {
+            const wrap = document.createElement('div')
+            wrap.className = 'bblf-chips'
+            options.forEach(function(v) {
+                const c = document.createElement('button')
+                c.className = 'bblf-chip-btn' + (getSetting(key) === v ? ' on' : '')
+                c.textContent = fmt ? fmt(v) : String(v)
+                c.onclick = function() {
+                    setSetting(key, v)
+                    renderSettings()
+                }
+                wrap.appendChild(c)
+            })
+            return wrap
+        }
+        mkRow('Reddit refresh', 'how often the Feed tab polls', mkChips('redditInterval', [15, 30, 45, 60], function(v) { return v + 's' }))
+        mkRow('Stream quality', null, mkChips('preferredQuality', ['AUTO', '720p', '1080p']))
+        mkRow('Theater mode', 'hide P+ chrome, lock scrolling', mkSwitch('theaterMode'))
+        mkRow('Hide channel guide', 'the hover guide over the video', mkSwitch('hideGuideOverlay'))
+        mkRow('Transport bar', null, mkSwitch('showTransportBar'))
+        mkRow('Audio controls in bar', 'pan + gain boost', mkSwitch('showAudioControls'))
+        mkRow('Feed status', 'FeedBot up/down in the bar', mkSwitch('enableFeedStatus'))
+        const foot = document.createElement('div')
+        foot.style.cssText = 'padding:14px 16px;font-size:11px;color:rgba(235,235,245,0.45);display:flex;align-items:center;gap:10px;'
+        const note = document.createElement('span')
+        note.textContent = 'Settings persist across script updates.'
+        const reset = document.createElement('button')
+        reset.className = 'bblf-chip-btn'
+        reset.textContent = 'Reset'
+        reset.onclick = function() {
+            settingsStore = {}
+            try { localStorage.removeItem('bblf_settings') } catch (e) {}
+            Object.keys(SETTINGS_DEFAULTS).forEach(applySetting)
+            renderSettings()
+        }
+        foot.appendChild(note)
+        foot.appendChild(reset)
+        tab.appendChild(foot)
+    }
+
+    // --- player transport controls (buffer-seek logic ported from the BBViewer extension) ---
 
     function getVideoEl() {
         return document.querySelector('.aa-player-skin .player-wrapper video') || document.querySelector('video')
@@ -738,7 +883,7 @@ v 1.2
             skin.appendChild(toast)
         }
         var bar = document.getElementById('bblf-transport')
-        if (!bar && showTransportBar) {
+        if (!bar && getSetting('showTransportBar')) {
             bar = document.createElement('div')
             bar.id = 'bblf-transport'
             const mk = function(glyph, tip, fn, id) {
@@ -750,7 +895,7 @@ v 1.2
                 b.onclick = fn
                 return b
             }
-            if (enableFeedStatus) {
+            if (getSetting('enableFeedStatus')) {
                 const feeds = document.createElement('div')
                 feeds.id = 'bblf-feeds'
                 feeds.title = 'BB feed status via FeedBot'
@@ -792,7 +937,7 @@ v 1.2
             const sep = document.createElement('div')
             sep.className = 'bblf-tsep'
             bar.appendChild(sep)
-            if (showAudioControls) {
+            if (getSetting('showAudioControls')) {
                 ;[{ pan: 'left', label: 'L' }, { pan: 'none', label: 'C' }, { pan: 'right', label: 'R' }].forEach(function(p) {
                     const b = mk(p.label, p.pan === 'left' ? 'audio left  (q)' : (p.pan === 'none' ? 'audio center  (w)' : 'audio right  (e)'),
                         function() { adjustChannel(p.pan) })
@@ -865,6 +1010,7 @@ v 1.2
     // --- feed status (FeedBot: feedbot.liquid8d.dev / @feed-bot.bsky.social) ---
 
     async function refreshFeedStatus() {
+        if (!getSetting('enableFeedStatus')) return
         try {
             const d = await gmFetchJson('https://feedbot.liquid8d.dev/assets/' + feedbotSeason + '/latest.json')
             var events = []
@@ -928,11 +1074,11 @@ v 1.2
         const thumb = document.createElement('div')
         thumb.id = 'bblf-seg-thumb'
         seg.appendChild(thumb)
-        ;['feed', 'house'].forEach(function(t) {
+        ;['feed', 'house', 'settings'].forEach(function(t) {
             const b = document.createElement('button')
             b.className = 'bblf-seg-btn'
             b.dataset.tab = t
-            b.textContent = (t === 'feed') ? 'Feed' : 'House'
+            b.textContent = (t === 'feed') ? 'Feed' : (t === 'house' ? 'House' : 'Settings')
             b.onclick = function() { switchTab(t) }
             seg.appendChild(b)
         })
@@ -992,9 +1138,14 @@ v 1.2
         house.id = 'bblf-tab-house'
         house.style.cssText = 'flex:1;min-height:0;display:none;flex-direction:column;'
 
+        const settingsTab = document.createElement('div')
+        settingsTab.id = 'bblf-tab-settings'
+        settingsTab.style.cssText = 'flex:1;min-height:0;display:none;overflow-y:auto;overscroll-behavior:contain;'
+
         panel.appendChild(segWrap)
         panel.appendChild(feedWrap)
         panel.appendChild(house)
+        panel.appendChild(settingsTab)
         skin.appendChild(panel)
         applyPanel()
         switchTab(panelTab)
@@ -1034,7 +1185,7 @@ v 1.2
     function redditStart() {
         if (redditTimer) return
         redditRefresh(false)
-        redditTimer = setInterval(function() { redditRefresh(false) }, redditCommentInterval)
+        redditTimer = setInterval(function() { redditRefresh(false) }, getSetting('redditInterval') * 1000)
     }
 
     function redditStop() {
@@ -1070,6 +1221,7 @@ v 1.2
     }
 
     async function redditRefresh(force) {
+        if (Date.now() < redditCooldownUntil && !force) return
         try {
             setPanelStatus('Updating…')
             if (force || !redditThread || (Date.now() - redditLastDiscover) > redditThreadInterval) {
@@ -1079,7 +1231,13 @@ v 1.2
             await redditFetchComments()
             setPanelStatus('Updated ' + new Date().toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }) + ' · r/' + redditSub)
         } catch (e) {
-            setPanelStatus((e && e.message) ? e.message : String(e), true)
+            const msg = (e && e.message) ? e.message : String(e)
+            if (msg.indexOf('429') !== -1) {
+                redditCooldownUntil = Date.now() + 120 * 1000
+                setPanelStatus('rate limited - pausing for 2 min', true)
+            } else {
+                setPanelStatus(msg, true)
+            }
         }
     }
 
@@ -1190,11 +1348,14 @@ v 1.2
         panelTab = t
         const feed = document.getElementById('bblf-tab-feed')
         const house = document.getElementById('bblf-tab-house')
+        const settings = document.getElementById('bblf-tab-settings')
         if (feed) feed.style.display = (t === 'feed') ? 'flex' : 'none'
         if (house) house.style.display = (t === 'house') ? 'flex' : 'none'
+        if (settings) settings.style.display = (t === 'settings') ? 'block' : 'none'
         const thumb = document.getElementById('bblf-seg-thumb')
-        if (thumb) thumb.style.transform = (t === 'feed') ? 'translateX(0%)' : 'translateX(100%)'
+        if (thumb) thumb.style.transform = (t === 'feed') ? 'translateX(0%)' : (t === 'house' ? 'translateX(100%)' : 'translateX(200%)')
         if (t === 'house') renderHouse()
+        if (t === 'settings') renderSettings()
     }
 
     // parse the mod sticky. mid-week format:
