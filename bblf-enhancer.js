@@ -209,7 +209,7 @@ v 1.2
     const showTransportBar = true
     // --- cast wall (House tab) ---
     // portraits live in the repo (assets/cast/bb28); update folder + list each season
-    const castImageBase = 'https://raw.githubusercontent.com/stauby22/bblf-enhancer/phase0/assets/cast/bb28/'
+    const castImageBase = 'https://raw.githubusercontent.com/stauby22/bblf-enhancer/main/assets/cast/bb28/'
     const HOUSEGUESTS = ['Angela', 'Ashley', 'Barrett', 'Chuk', 'Dee', 'Drew', 'Haley', 'Jason', 'Kamu', 'Latrice', 'Lyric', 'Mallory', 'Melody', 'Rick', 'Rome', 'Taylor', 'Yash']
     // manual extra evictions (the parser also auto-remembers evictions from stickies in localStorage)
     const evictedHouseguests = []
