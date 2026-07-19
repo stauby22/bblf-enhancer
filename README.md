@@ -65,5 +65,4 @@ Once a year, in the config block at the top of the script:
 
 ## Credits
 
-- **[liquid8d](https://github.com/liquid8d)** — the original BBLF Enhancer userscript, the BBViewer extension whose techniques this fork ports, and the FeedBot service this fork consumes. Three of the four good ideas here are his.
-- Sidebar design mocked in [Claude](https://claude.ai), built with Claude Code.
+- **[liquid8d](https://github.com/liquid8d)** — the original BBLF Enhancer userscript, the BBViewer extension whose techniques this fork ports, and the FeedBot service this fork consumes. 
