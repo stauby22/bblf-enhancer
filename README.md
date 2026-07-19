@@ -1,82 +1,69 @@
-# browser-scripts
+# BBLF Enhancer
 
-A collection of random browser scripts to enhance various websites.
+A Tampermonkey userscript that turns the **Big Brother US live feeds on Paramount+** into a proper viewing cockpit: transport controls, a Reddit live-thread reader, a cast wall that tracks the state of the house, and feed up/down status — all in a native, macOS-style UI overlaid on the player.
 
-# Tampermonkey Script (bblf-enhancer.js)
-
-This is a tampermonkey script that will improve the experience on the Big Brother Live Feeds page.
+> **Fork of [liquid8d/browser-scripts](https://github.com/liquid8d/browser-scripts)** — the original BBLF Enhancer is by [liquid8d](https://github.com/liquid8d), who also built the [BBViewer extension](https://chromewebstore.google.com/detail/bbviewer/lofnjlciokhgalebinnlfhkicepmmceh) and [FeedBot](https://feedbot.liquid8d.dev/). This fork keeps the original's watchdog core and layers a lot on top. Several player techniques (quality category fix, fullscreen defuse, buffer seeking) were ported from BBViewer.
 
 ## Features
-* Add number hotkeys for switching cameras (1-5)
-* Watch for video error messages and reload page
-* Extended Watch: Watch for 'Still watching' or 'Timeout' messages and click or reload page
-* Hides P+ controls and show video scrubber
-* Auto-switch to Quad cam at startup (optional)
 
-Any of these features are optional by changing the settings in the script.
+**From the original script**
+- Watchdog loop: auto-reload on stream errors, "still watching" click-through, force play
+- 1080p quality unlock (Paramount+ caps browser streams lower by default)
+- Camera hotkeys, audio channel pan (feeds put different rooms on left/right channels)
 
-** Warning: this will run custom javascript and modify the way some things work on the Paramount+ Live Feeds page temporarily, and may cause issues navigating or using the page. You can disable it in Tampermonkey by toggling the script off. A page refresh may be required. **
+**Added in this fork**
+- **Transport bar** (Apple Music-style): skip ±30s / ±5min within the buffer, pause that *sticks*, jump-to-live pill showing how far behind you are, picture-in-picture, mute, fullscreen
+- **Feed status via [FeedBot](https://feedbot.liquid8d.dev/)**: live dot + "up · 2h 14m" / "fish · 3m" / "down · 12m", with recent state changes and the typical outage schedule in the tooltip
+- **Sidebar panel** (`r` to toggle; pushes the video over, never covers quad view):
+  - **Feed** — live reader for the current r/BigBrother *Feed Discussion* thread: auto-discovers the morning/afternoon/evening/late-night thread by flair, polls comments (rate configurable), preserves your scroll position, "N new" pill
+  - **House** — cast wall with portraits and badges (👑 HOH, NOM, V·POV, SAVED, HAVE-NOT, BBB, OUT), auto-parsed from the mod sticky in the discussion thread; evictions are remembered in localStorage for the rest of the season
+  - **Settings** — refresh rate, quality, theater mode, and UI toggles, persisted in localStorage so they survive script updates
+- **Theater mode**: locks page scrolling and hides Paramount's chrome (slide-in header, footer, hover gradients, their LIVE badge)
+- Audio gain boost (up to 3×) alongside the pan controls
+- iOS-style design throughout: translucent materials, segmented controls, system colors
 
-## Install instructions:
+## Install
 
-1. Install the [Tampermonkey extension](https://chromewebstore.google.com/detail/tampermonkey/dhdgffkkebhmkfjojejmpbldmpobfkfo) in your browser.
+1. Install [Tampermonkey](https://www.tampermonkey.net/) (and enable **Allow User Scripts** in the extension's settings if your browser requires it)
+2. Install the script from the raw URL (Tampermonkey dashboard → Utilities → Import from URL):
+   `https://raw.githubusercontent.com/stauby22/bblf-enhancer/main/bblf-enhancer.js`
+3. Open a Big Brother live feed camera on Paramount+ (requires a subscription with live feeds) and click the start overlay once — everything else is automatic
 
-2. **You will need to allow User Scripts to run in the extension settings**. In your browser, find your Extension Settings, click on Details for Tampermonkey. Scroll to Allow User Scripts and toggle it on.
+`bblf-enhancer.css` is the legacy Stylebot stylesheet from the upstream repo; this fork injects its own CSS and doesn't need it.
 
-2. In the Tampermonkey dashboard, click Utilities, and copy the following url into the Import from URL box:
+## Hotkeys
 
-    `https://raw.githubusercontent.com/liquid8d/browser-scripts/refs/heads/main/bblf-enhancer.js`
+| Key | Action |
+|---|---|
+| `1`–`4` | Cameras 1–4 |
+| `5` | Quad cam |
+| `←` / `→` | Skip ±30s |
+| `,` / `.` | Skip ±5 min |
+| `l` | Jump to live |
+| `p` | Picture-in-picture |
+| `f` | Fullscreen (video only) |
+| `m` | Mute |
+| `q` / `w` / `e` | Audio pan left / center / right |
+| `[` / `]` | Gain boost down / up |
+| `r` | Toggle sidebar panel |
 
-3. Click the Install button, then Install again.
+## New season setup
 
-4. With the script installed, visit the [Big Brother](https://www.paramountplus.com/shows/big_brother/) P+ page, and select a Live Feed camera.
+Once a year, in the config block at the top of the script:
 
-5. With the video loaded, ensure the script is enabled by clicking the Tampermonkey button in your extensions bar (usually the top-right of the browser, accessed by clicking the puzzle piece icon) and look for BBLF Enhancer on. Toggle it on if it is not already.
+- Update `LIVETV_CAMS` with the season's five camera URLs
+- Drop portraits into `assets/cast/bbXX/` (lowercase first names, `.jpg`) and update `castImageBase` + `HOUSEGUESTS`
+- Add any sticky nicknames to `NAME_ALIASES` (e.g. `'devens': 'Rick'`)
+- Bump `evictedStoreKey` and `feedbotSeason`
 
-To disable the script at any time, toggle BBLF Enhancer script off in Tampermonkey, and refresh the page.
+## Caveats
 
-# Stylebot CSS (bblf-enhancer.css)
+- This hooks Paramount+'s **internal, undocumented** player and DOM. It breaks when they change their site; expect to patch each season (the changelog in the script header is a history of exactly that).
+- Rewind depth = what your session has buffered. Paramount's server-side DVR window is only ~18 seconds, so nobody can seek before your page load — not this script, not the extension.
+- The Reddit reader uses your logged-in reddit.com session (via `GM_xmlhttpRequest`); logged-out requests may be blocked by Reddit.
+- Unofficial fan project for personal use. Not affiliated with CBS, Paramount, or Reddit. Houseguest portraits are CBS promotional photography (credit embedded in the image files).
 
-This is some custom CSS to clean up the Live TV interface on Paramount+ when watching Big Brother Live Feeds.
+## Credits
 
-** Warning: this will modify the display of the Paramount+ Live TV, and may cause issues navigating or using the page. You can disable it in Stylebot by toggling it off to return to normal. A page refresh may be required. **
-
-## Features
-* Removes the header/footer to make video fill the page
-* Removes the Live TV menu
-* (optional) hide the video controls
-
-## Install instructions:
-
-1. Install the [Stylebot extension](https://chromewebstore.google.com/detail/stylebot/oiaejidbmkiecgbjeifoejpgmdaleoha) in your browser.
-
-2. Click the Stylebot icon in your browser extensions bar (usually the top-right of the browser, accessed by clicking the puzzle piece icon - you can pin Stylebot for easier access), then click Options
-
-3. Go to Styles, Add a new style...
-
-4. In Enter URL... box, type:
-
-    `https://www.paramountplus.com/live-tv/stream/big_brother/*`
-
-5. In the code box, copy and paste the css provided here:
-
-    `https://raw.githubusercontent.com/liquid8d/browser-scripts/refs/heads/main/bblf-enhancer.css`
-
-6. Click the Save button.
-
-7. If you don't even want the controls to display, comment the controls-manager css.
-
-## Post Install
-Go to the Big Brother page and pick a Live Feed camera: 
-
-`https://www.paramountplus.com/shows/big_brother/`
-
-If the css is applied correctly, you should now only see video on the live tv channels for Big Brother, and menus and overlays will be hidden.
-
-**This CSS hides the Live TV menu, how do I switch cameras?!**
-
-* Click the Stylebot extension icon to disable the CSS
-* Access the Live Feed thumbnails on the Big Brother page
-* Bookmark each camera url directly and change that way
-
-
+- **[liquid8d](https://github.com/liquid8d)** — the original BBLF Enhancer userscript, the BBViewer extension whose techniques this fork ports, and the FeedBot service this fork consumes. Three of the four good ideas here are his.
+- Sidebar design mocked in [Claude](https://claude.ai), built with Claude Code.
