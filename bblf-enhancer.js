@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BBLF Enhancer
 // @namespace    http://tampermonkey.net/
-// @version      1.13
+// @version      1.13.1
 // @description  Monitor for issues on Big Brother Live Feed streams, reloading or starting video when necessary. Can autoload quad cam, add hotkeys, show video scrubber, and remap fullscreen button to only show video.
 // @author       liquid8d
 // @match        https://www.paramountplus.com/live-tv/stream/big_brother/*
@@ -14,6 +14,8 @@
 
 // ==/UserScript==
 /*
+v 1.13.1 (2026)
+ - mute button in the transport bar + 'm' hotkey
 v 1.13 (2026)
  - Settings tab: reddit refresh rate (15-60s), stream quality, theater mode,
    guide hiding, transport bar, audio controls, feed status - all persisted in
@@ -138,7 +140,8 @@ v 1.2
         { key: ',', action: function() { playerSkip(-seekLarge) } },
         { key: '.', action: function() { playerSkip(seekLarge) } },
         { key: 'l', action: function() { playerGoLive() } },
-        { key: 'p', action: function() { playerPip() } }
+        { key: 'p', action: function() { playerPip() } },
+        { key: 'm', action: function() { playerToggleMute() } }
     ]
 
     // force allow up to 1080p resolution
@@ -830,6 +833,15 @@ v 1.2
         updateTransportBar()
     }
 
+    function playerToggleMute() {
+        if (!enablePlayerControls) return
+        const video = getVideoEl()
+        if (!video) return
+        video.muted = !video.muted
+        showSeekToast(video.muted ? 'muted' : 'unmuted')
+        updateTransportBar()
+    }
+
     function playerPip() {
         if (!enablePlayerControls) return
         const video = getVideoEl()
@@ -968,6 +980,7 @@ v 1.2
             bar.appendChild(mk('⧉', 'picture in picture  (p)', function() { playerPip() }))
             bar.appendChild(mk('☰', 'panel  (r)', function() { togglePanel() }))
             bar.appendChild(mk('⤢', 'fullscreen  (f)', function() { toggleFullscreen() }))
+            bar.appendChild(mk('🔊', 'mute  (m)', function() { playerToggleMute() }, 'bblf-t-mute'))
             skin.appendChild(bar)
             updatePanUI()
         }
@@ -995,6 +1008,8 @@ v 1.2
         if (!video) return
         const playBtn = document.getElementById('bblf-t-play')
         if (playBtn) playBtn.textContent = video.paused ? '▶' : '❚❚'
+        const muteBtn = document.getElementById('bblf-t-mute')
+        if (muteBtn) muteBtn.textContent = video.muted ? '🔇' : '🔊'
         const range = bufferedRange(video)
         const pill = document.getElementById('bblf-live-pill')
         const label = document.getElementById('bblf-live-label')
