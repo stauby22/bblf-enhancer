@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BBLF Enhancer
 // @namespace    http://tampermonkey.net/
-// @version      1.13.1
+// @version      1.13.2
 // @description  Monitor for issues on Big Brother Live Feed streams, reloading or starting video when necessary. Can autoload quad cam, add hotkeys, show video scrubber, and remap fullscreen button to only show video.
 // @author       liquid8d
 // @match        https://www.paramountplus.com/live-tv/stream/big_brother/*
@@ -14,6 +14,9 @@
 
 // ==/UserScript==
 /*
+v 1.13.2 (2026)
+ - thread discovery prefers titles containing 'Feed Discussion' - the 'Feeds vs
+   Episode' thread shares the flair and was hijacking the Feed tab during episodes
 v 1.13.1 (2026)
  - mute button in the transport bar + 'm' hotkey
 v 1.13 (2026)
@@ -183,6 +186,9 @@ v 1.2
     // subreddit + link flair of the live feed discussion threads
     const redditSub = 'BigBrother'
     const redditFlair = 'Feed Discussion'
+    // live threads also carry this in the title ("Afternoon Feed Discussion - ...");
+    // other posts share the flair (e.g. "Feeds vs Episode"), so the title decides
+    const redditTitleFilter = 'Feed Discussion'
     // how often to poll for new comments while the panel is open (secs * ms)
     const redditCommentInterval = 45 * 1000
     // how often to re-check which discussion thread is current (secs * ms)
@@ -1262,7 +1268,10 @@ v 1.2
             .filter(function(p) { return p.link_flair_text === redditFlair })
         if (!posts.length) throw new Error('no "' + redditFlair + '" thread found in r/' + redditSub)
         posts.sort(function(a, b) { return b.created_utc - a.created_utc })
-        const t = posts[0]
+        const titled = posts.filter(function(p) {
+            return p.title.toLowerCase().indexOf(redditTitleFilter.toLowerCase()) !== -1
+        })
+        const t = (titled.length ? titled : posts)[0]
         if (!redditThread || redditThread.id !== t.id) {
             redditThread = { id: t.id, title: t.title, permalink: t.permalink }
             redditSeen = {}
