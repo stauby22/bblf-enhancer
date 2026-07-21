@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BBLF Enhancer
 // @namespace    http://tampermonkey.net/
-// @version      1.13.2
+// @version      1.14
 // @description  Monitor for issues on Big Brother Live Feed streams, reloading or starting video when necessary. Can autoload quad cam, add hotkeys, show video scrubber, and remap fullscreen button to only show video.
 // @author       liquid8d
 // @match        https://www.paramountplus.com/live-tv/stream/big_brother/*
@@ -14,6 +14,11 @@
 
 // ==/UserScript==
 /*
+v 1.14 (2026)
+ - PiP fix for Chrome: strip P+'s disablepictureinpicture attribute before
+   requesting, and surface async rejections in the seek toast
+ - typical outage schedule on the House tab (below the cast grid), with
+   today's row highlighted
 v 1.13.2 (2026)
  - thread discovery prefers titles containing 'Feed Discussion' - the 'Feeds vs
    Episode' thread shares the flair and was hijacking the Feed tab during episodes
@@ -211,6 +216,13 @@ v 1.2
     const feedbotSeason = 'bb28'
     // how often to poll feedbot (secs * ms)
     const feedbotInterval = 60 * 1000
+    // typical outage schedule (estimates, via FeedBot) - shown on the House tab, today highlighted
+    const OUTAGE_SCHEDULE = [
+        { day: 1, name: 'Monday', events: 'Veto Ceremony — around 11am for 1.5 hours' },
+        { day: 4, name: 'Thursday', events: '"Tech rehearsals" (HOH lockdown) around 11am; feeds usually return briefly, then down around 2pm' },
+        { day: 5, name: 'Friday', events: 'Nominations — around 3pm for 1.5 hours' },
+        { day: 6, name: 'Saturday', events: 'Veto Picks 9am (45 min) · Veto Comp 12pm (3 hours, 6 for individual comps)' }
+    ]
     // show the transport bar (apple-music style) over the video
     const showTransportBar = true
     // --- cast wall (House tab) ---
@@ -853,10 +865,24 @@ v 1.2
         const video = getVideoEl()
         if (!video) return
         try {
-            if (document.pictureInPictureElement) document.exitPictureInPicture()
-            else video.requestPictureInPicture()
+            if (document.pictureInPictureElement) {
+                document.exitPictureInPicture()
+                return
+            }
+            // P+ sets disablepictureinpicture on the video; Chrome honors it and rejects the request
+            if (video.hasAttribute('disablepictureinpicture')) video.removeAttribute('disablepictureinpicture')
+            video.disablePictureInPicture = false
+            if (document.pictureInPictureEnabled === false) {
+                showSeekToast('PiP blocked by browser settings')
+                return
+            }
+            video.requestPictureInPicture().catch(function(e) {
+                warn('pip failed: ' + e)
+                showSeekToast('PiP failed: ' + ((e && e.name) ? e.name : e))
+            })
         } catch (e) {
             warn('pip failed: ' + e)
+            showSeekToast('PiP failed: ' + ((e && e.name) ? e.name : e))
         }
     }
 
@@ -1508,6 +1534,39 @@ v 1.2
         grid.style.cssText = 'display:grid;grid-template-columns:repeat(3,1fr);gap:20px 8px;'
         HOUSEGUESTS.forEach(function(name) { grid.appendChild(renderCastCard(name, state)) })
         scroll.appendChild(grid)
+
+        // typical outage schedule, today highlighted
+        const schedHead = document.createElement('div')
+        schedHead.style.cssText = 'font-weight:700;font-size:13px;color:#fff;margin-top:20px;'
+        schedHead.textContent = 'Typical Outages'
+        scroll.appendChild(schedHead)
+        const schedSub = document.createElement('div')
+        schedSub.style.cssText = 'font-size:11px;color:rgba(235,235,245,0.45);margin-bottom:6px;'
+        schedSub.textContent = 'estimated · via FeedBot'
+        scroll.appendChild(schedSub)
+        const today = new Date().getDay()
+        OUTAGE_SCHEDULE.forEach(function(o) {
+            const isToday = o.day === today
+            const row = document.createElement('div')
+            row.style.cssText = 'display:flex;gap:8px;padding:6px 0;font-size:12px;line-height:1.4;' +
+                'border-bottom:0.5px solid rgba(255,255,255,0.06);' +
+                (isToday ? 'color:#fff;' : 'color:rgba(235,235,245,0.6);')
+            const dayEl = document.createElement('span')
+            dayEl.style.cssText = 'min-width:32px;font-weight:600;flex-shrink:0;' + (isToday ? 'color:#30d158;' : '')
+            dayEl.textContent = o.name.slice(0, 3)
+            const txt = document.createElement('span')
+            txt.textContent = o.events
+            row.appendChild(dayEl)
+            row.appendChild(txt)
+            if (isToday) {
+                const chip = document.createElement('span')
+                chip.style.cssText = 'margin-left:auto;align-self:flex-start;background:rgba(48,209,88,0.18);color:#30d158;' +
+                    'font-size:9.5px;font-weight:700;padding:1.5px 7px;border-radius:6px;letter-spacing:0.4px;flex-shrink:0;'
+                chip.textContent = 'TODAY'
+                row.appendChild(chip)
+            }
+            scroll.appendChild(row)
+        })
 
         if (state && state.extras.length) {
             const ex = document.createElement('div')
