@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BBLF Enhancer
 // @namespace    http://tampermonkey.net/
-// @version      1.14
+// @version      1.14.1
 // @description  Monitor for issues on Big Brother Live Feed streams, reloading or starting video when necessary. Can autoload quad cam, add hotkeys, show video scrubber, and remap fullscreen button to only show video.
 // @author       liquid8d
 // @match        https://www.paramountplus.com/live-tv/stream/big_brother/*
@@ -14,6 +14,8 @@
 
 // ==/UserScript==
 /*
+v 1.14.1 (2026)
+ - hard-code BB28 evictions so far (Jason, Ashley, Lyric, Rome) in evictedHouseguests
 v 1.14 (2026)
  - PiP fix for Chrome: strip P+'s disablepictureinpicture attribute before
    requesting, and surface async rejections in the seek toast
@@ -229,8 +231,8 @@ v 1.2
     // portraits live in the repo (assets/cast/bb28); update folder + list each season
     const castImageBase = 'https://raw.githubusercontent.com/stauby22/bblf-enhancer/main/assets/cast/bb28/'
     const HOUSEGUESTS = ['Angela', 'Ashley', 'Barrett', 'Chuk', 'Dee', 'Drew', 'Haley', 'Jason', 'Kamu', 'Latrice', 'Lyric', 'Mallory', 'Melody', 'Rick', 'Rome', 'Taylor', 'Yash']
-    // manual extra evictions (the parser also auto-remembers evictions from stickies in localStorage)
-    const evictedHouseguests = []
+    // manual evictions - always grayed out, merged with the ones auto-remembered from stickies
+    const evictedHouseguests = ['Jason', 'Ashley', 'Lyric', 'Rome']
     // localStorage key where auto-detected evictions accumulate (clear it or bump per season)
     const evictedStoreKey = 'bblf_evicted_bb28'
     // sticky nickname -> cast name (the mod sticky uses nicknames for some houseguests)
