@@ -19,7 +19,15 @@ A Tampermonkey userscript that turns the **Big Brother US live feeds on Paramoun
   - **House** — cast wall with portraits and badges (👑 HOH, NOM, V·POV, SAVED, HAVE-NOT, BBB, OUT), auto-parsed from the mod sticky in the discussion thread; evictions are remembered in localStorage for the rest of the season
   - **Settings** — refresh rate, quality, theater mode, and UI toggles, persisted in localStorage so they survive script updates
 - **Theater mode**: locks page scrolling and hides Paramount's chrome (slide-in header, footer, hover gradients, their LIVE badge)
-- Audio gain boost (up to 3×) alongside the pan controls
+- **Automatic break muting**: production's "we'll be right back" music bed is detected from its
+  spectral signature and that side of the feed is ducked before it hits you — per channel, since
+  a break can take one cam while the other stays live. Learn the bed once (`k` during a break) and
+  it's stored locally; no bundled fingerprint to go stale between seasons
+- **Speech leveling** (gated upward compression — 2am HOH whispering comes up, silence doesn't get
+  pumped) and **channel balance auto-trim**, both bounded and both frozen while a side is muted
+- **Continuous feed fader** — blend between the left and right cameras at any ratio, with `q`/`w`/`e`
+  as jump-to-position shortcuts
+- Audio gain boost (up to 3×)
 - iOS-style design throughout: translucent materials, segmented controls, system colors
 
 ## Install
@@ -46,6 +54,10 @@ A Tampermonkey userscript that turns the **Big Brother US live feeds on Paramoun
 | `q` / `w` / `e` | Audio pan left / center / right |
 | `[` / `]` | Gain boost down / up |
 | `r` | Toggle sidebar panel |
+| `k` | Learn break music (45s, during a break) |
+| `j` | Toggle auto-mute |
+| `Shift`+`K` | Clear the learned break profile |
+| `Shift`+`C` | Dump the detector capture buffer (tuning) |
 
 ## New season setup
 
@@ -61,8 +73,18 @@ Once a year, in the config block at the top of the script:
 - This hooks Paramount+'s **internal, undocumented** player and DOM. It breaks when they change their site; expect to patch each season (the changelog in the script header is a history of exactly that).
 - Rewind depth = what your session has buffered. Paramount's server-side DVR window is only ~18 seconds, so nobody can seek before your page load — not this script, not the extension.
 - The Reddit reader uses your logged-in reddit.com session (via `GM_xmlhttpRequest`); logged-out requests may be blocked by Reddit.
+- Break detection is **audio-only** and needs a learned profile before it can do anything. Under
+  Widevine DRM the video frames read back as pure black to a userscript, so there is no visual
+  evidence available — the detector works from the music's spectral shape alone.
+- Speech leveling and balance auto-trim ship **off**; they alter what you hear, so turn them on
+  deliberately in Settings. Every automatic gain stage is hard-capped.
 - Unofficial fan project for personal use. Not affiliated with CBS, Paramount, or Reddit. Houseguest portraits are CBS promotional photography (credit embedded in the image files).
 
 ## Credits
 
-- **[liquid8d](https://github.com/liquid8d)** — the original BBLF Enhancer userscript, the BBViewer extension whose techniques this fork ports, and the FeedBot service this fork consumes. 
+- **[liquid8d](https://github.com/liquid8d)** — the original BBLF Enhancer userscript, the BBViewer extension whose techniques this fork ports, and the FeedBot service this fork consumes.
+- **WBRB Volume** (MIT) — the automatic break detection here was implemented independently,
+  informed by studying that extension's approach: per-side authority over the mute, normalized
+  spectral fingerprints matched as a circular sequence, and fade-valley handling so a mute doesn't
+  lift during the music's quiet passages. Techniques and threshold starting points are fair to
+  learn from; this implementation is ours. 
