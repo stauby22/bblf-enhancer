@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BBLF Enhancer
 // @namespace    http://tampermonkey.net/
-// @version      1.15
+// @version      1.15.1
 // @description  Monitor for issues on Big Brother Live Feed streams, reloading or starting video when necessary. Can autoload quad cam, add hotkeys, show video scrubber, and remap fullscreen button to only show video.
 // @author       liquid8d
 // @match        https://www.paramountplus.com/live-tv/stream/big_brother/*
@@ -14,6 +14,16 @@
 
 // ==/UserScript==
 /*
+v 1.15.1 (2026)
+ - FIX: the fingerprint was dominated by the spectral tilt every natural audio signal shares,
+   so unrelated house audio scored ~0.86 against a learned profile - above the entry threshold
+   and far above the continuation threshold. The detector could mute on anything and could
+   never release. Band vectors are now linear-detrended before normalising (house audio drops
+   to ~0.13 in simulation, break music stays ~0.99)
+ - profile storage is versioned by fingerprint; profiles from the old feature are discarded
+ - entry now also has to beat a self-calibrating baseline of what the feed normally scores
+ - SAFETY NET: a duck is released if it goes 45s without a full-confidence frame, so a mute
+   can never latch permanently regardless of tuning
 v 1.15 (2026)
  - audio engine rebuilt: source -> splitter -> [detector taps] -> trim -> level -> duck ->
    fader matrix -> merger -> boost. stages park at unity when off; graph is never rewired
@@ -309,7 +319,17 @@ v 1.2
     const wbrbMaxHz = 8000
     const wbrbBandCount = 32
     // learned profile storage (bump per season - the break bed changes)
-    const wbrbProfileKey = 'bblf_wbrb_profile_bb28'
+    // v2 = linear-detrend fingerprint. the key is versioned because a profile recorded with a
+    // different feature is meaningless in the new vector space - old ones are discarded, not reused
+    const wbrbProfileKey = 'bblf_wbrb_profile_bb28_v2'
+    const wbrbFeatureVersion = 'detrend-v2'
+    // entry also has to beat what this feed normally scores, so a feed whose ordinary audio
+    // happens to score high can never sit permanently muted
+    const wbrbEntryMarginOverBaseline = 0.15
+    // SAFETY NET: a duck may not be held longer than this without at least one frame at full
+    // entry confidence. real break music is a loop and re-confirms constantly, so a genuine
+    // multi-hour outage keeps renewing this; a duck stuck on live audio releases on its own
+    const wbrbMaxHoldWithoutStrongMs = 45000
     // capture ring buffer length for the replay harness (minutes)
     const wbrbCaptureMinutes = 10
 
@@ -843,7 +863,7 @@ v 1.2
         return {
             recent: [], score: -1, confirmations: 0, active: false,
             failingSince: 0, matchedLevelDb: -100, valleySince: 0, levelDb: -100,
-            levelGainDb: 0, avgDb: -100
+            levelGainDb: 0, avgDb: -100, baseline: -1, lastStrongAt: 0
         }
     }
 
@@ -892,7 +912,32 @@ v 1.2
             const meanPower = count > 0 ? power / count : 1e-12
             bands[b] = 10 * Math.log10(Math.max(meanPower, 1e-12))
         }
-        return wbrbNormalize(bands)
+        return wbrbDetrendNormalize(bands)
+    }
+
+    // Remove the straight-line trend across band index, THEN mean-centre and unit-scale.
+    //
+    // This is the difference between a working detector and a broken one. Every natural audio
+    // signal - break music, conversation, room tone - shares a broad downward spectral tilt.
+    // Mean-centring alone leaves that tilt dominating the vector, so unrelated audio scored
+    // ~0.86 against a learned profile: above the entry threshold and far above the continuation
+    // threshold, which meant the detector could mute on anything and then never release.
+    // Detrending strips the shared component and leaves what actually distinguishes the music.
+    // (Differencing adjacent bands works about as well; detrending keeps more of the shape and
+    // amplifies noise less.)
+    function wbrbDetrendNormalize(values) {
+        const n = values.length
+        if (n < 3) return wbrbNormalize(values)
+        var sx = 0, sy = 0, sxy = 0, sxx = 0
+        for (var i = 0; i < n; i++) {
+            sx += i; sy += values[i]; sxy += i * values[i]; sxx += i * i
+        }
+        const denom = n * sxx - sx * sx
+        const slope = (Math.abs(denom) < 1e-9) ? 0 : (n * sxy - sx * sy) / denom
+        const intercept = (sy - slope * sx) / n
+        const flat = new Array(n)
+        for (var j = 0; j < n; j++) flat[j] = values[j] - (slope * j + intercept)
+        return wbrbNormalize(flat)
     }
 
     function wbrbCosine(a, b) {
@@ -955,20 +1000,36 @@ v 1.2
     function wbrbPolicyStep(st, score, levelDb, now, cfg) {
         st.score = score
         st.levelDb = levelDb
+        if (score >= cfg.entry) st.lastStrongAt = now
         if (!st.active) {
-            if (score >= cfg.entry) {
+            // Baseline of what this feed normally scores. Falls fast and rises slowly, so it
+            // tracks ordinary audio rather than being dragged up by a passing match.
+            if (st.baseline < 0) st.baseline = score
+            else st.baseline += (score < st.baseline ? 0.05 : 0.005) * (score - st.baseline)
+            const beatsBaseline = score >= st.baseline + cfg.entryMargin
+            if (score >= cfg.entry && beatsBaseline) {
                 st.confirmations++
                 if (st.confirmations >= cfg.confirmations) {
                     st.active = true
                     st.failingSince = 0
                     st.valleySince = 0
                     st.matchedLevelDb = levelDb
+                    st.lastStrongAt = now
                     return 'enter'
                 }
             } else {
                 st.confirmations = 0
             }
             return null
+        }
+        // SAFETY NET first: however confident the continuation logic feels, a duck that has not
+        // seen full entry-level evidence for this long is released. Never let a mute latch.
+        if (now - st.lastStrongAt >= cfg.maxHoldWithoutStrongMs) {
+            st.active = false
+            st.confirmations = 0
+            st.failingSince = 0
+            st.valleySince = 0
+            return 'release'
         }
         if (score >= cfg.continue_) {
             st.failingSince = 0
@@ -1008,7 +1069,9 @@ v 1.2
             confirmations: wbrbEntryConfirmations,
             graceMs: wbrbReleaseGraceMs,
             valleyDropDb: wbrbFadeValleyDropDb,
-            valleyMaxMs: wbrbFadeValleyMaxMs
+            valleyMaxMs: wbrbFadeValleyMaxMs,
+            entryMargin: wbrbEntryMarginOverBaseline,
+            maxHoldWithoutStrongMs: wbrbMaxHoldWithoutStrongMs
         }
     }
 
@@ -1234,6 +1297,13 @@ v 1.2
             if (!raw) return null
             const p = JSON.parse(raw)
             if (!p || !Array.isArray(p.frames) || !p.frames.length) return null
+            // a profile recorded with an older fingerprint cannot be compared against the
+            // current one - drop it rather than matching in the wrong vector space
+            if (p.feature !== wbrbFeatureVersion) {
+                warn('wbrb: discarding profile recorded with an older fingerprint - press k during a break to re-learn')
+                try { localStorage.removeItem(wbrbProfileKey) } catch (e) {}
+                return null
+            }
             return p
         } catch (e) { return null }
     }
@@ -1255,7 +1325,7 @@ v 1.2
         wbrbLearning = false
         if (save && wbrbLearnFrames.length > 20) {
             const rounded = wbrbLearnFrames.map(function(f) { return f.map(function(v) { return Math.round(v * 1000) / 1000 }) })
-            const profile = { frames: rounded, createdAt: Date.now(), frameMs: wbrbFrameMs }
+            const profile = { frames: rounded, createdAt: Date.now(), frameMs: wbrbFrameMs, feature: wbrbFeatureVersion }
             try {
                 localStorage.setItem(wbrbProfileKey, JSON.stringify(profile))
                 wbrbProfile = profile
@@ -1326,7 +1396,9 @@ v 1.2
                 ' lv' + L.levelGainDb.toFixed(1) + ' tr' + balanceTrimDb.left.toFixed(1) + '\n' +
             'R ' + fmt(R.score) + ' ' + R.levelDb.toFixed(0).padStart(4) + 'dB ' + mark(R) +
                 ' lv' + R.levelGainDb.toFixed(1) + ' tr' + balanceTrimDb.right.toFixed(1) + '\n' +
-            'corr ' + wbrbCorrelation.toFixed(3) + (wbrbCorrelation >= wbrbDuplicateCorrelation ? ' DUP' : '') +
+            'base ' + (L.baseline < 0 ? '—' : L.baseline.toFixed(2)) + '/' +
+                (R.baseline < 0 ? '—' : R.baseline.toFixed(2)) +
+            '  corr ' + wbrbCorrelation.toFixed(3) + (wbrbCorrelation >= wbrbDuplicateCorrelation ? ' DUP' : '') +
             (wbrbProfile ? '' : '\nno profile — press k during a break')
     }
 

@@ -7,7 +7,7 @@
 // the mute for valleyMaxMs + graceMs (10.5s) instead of capping at valleyMaxMs (7s).
 
 const src = require('fs').readFileSync(process.argv[2], 'utf8');
-const consts = `var wbrbBandCount=32, wbrbMinHz=80, wbrbMaxHz=8000, wbrbEntryThreshold=0.74,
+const consts = `var wbrbBandCount=32, wbrbEntryMarginOverBaseline=0.15, wbrbMaxHoldWithoutStrongMs=45000, wbrbMinHz=80, wbrbMaxHz=8000, wbrbEntryThreshold=0.74,
  wbrbContinueThreshold=0.66, wbrbEntryConfirmations=3, wbrbReleaseGraceMs=3500,
  wbrbFadeValleyDropDb=6, wbrbFadeValleyMaxMs=7000, levelTargetDb=-24, levelMaxBoostDb=12,
  levelMaxCutDb=6, levelGateDb=-52, levelWhisperFloorDb=-58, autoGainMaxDb=12;`;
@@ -18,7 +18,7 @@ const grab = (n) => {
   return m[0];
 };
 eval(consts + [
-  'wbrbNormalize', 'wbrbCosine', 'wbrbSequenceMatch', 'wbrbSpectrumToBands',
+  'wbrbNormalize', 'wbrbDetrendNormalize', 'wbrbCosine', 'wbrbSequenceMatch', 'wbrbSpectrumToBands',
   'wbrbNewSideState', 'wbrbPolicyStep', 'wbrbConfig', 'levelingGainDb', 'dbToGain', 'faderGains'
 ].map(grab).join('\n'));
 
@@ -61,16 +61,20 @@ t('1kHz spike lands in the band containing 1kHz', edges[peak] <= 1000 && edges[p
 
 console.log('\n— policy: entry —');
 const cfg = wbrbConfig();
+// prime the baseline with ordinary low-scoring audio, as happens in real use
+const prime = (state, from) => { let n = from; for (let i = 0; i < 30; i++) wbrbPolicyStep(state, 0.15, -25, n += 250, cfg); return n; };
 let st = wbrbNewSideState(), now = 0;
+now = prime(st, now);
 for (let i = 0; i < 2; i++) wbrbPolicyStep(st, 0.80, -20, now += 250, cfg);
 t('2 good frames do not mute yet', !st.active);
 t('3rd confirmation enters', wbrbPolicyStep(st, 0.80, -20, now += 250, cfg) === 'enter');
 st = wbrbNewSideState();
-for (let i = 0; i < 10; i++) wbrbPolicyStep(st, 0.70, -20, i * 250, cfg);
+let n2 = prime(st, 0);
+for (let i = 0; i < 10; i++) wbrbPolicyStep(st, 0.70, -20, n2 += 250, cfg);
 t('sub-threshold never enters', !st.active);
 
 console.log('\n— policy: fade valley (the mid-break release bug) —');
-st = wbrbNewSideState(); now = 0;
+st = wbrbNewSideState(); now = 0; now = prime(st, now);
 for (let i = 0; i < 3; i++) wbrbPolicyStep(st, 0.85, -20, now += 250, cfg);
 let released = null;
 for (let i = 0; i < 16; i++) {
@@ -89,7 +93,7 @@ t('valley cannot latch forever — hold caps near 7s', !st.active && heldMs <= 7
   '(held ' + heldMs + 'ms)');
 
 console.log('\n— policy: normal release —');
-st = wbrbNewSideState(); now = 0;
+st = wbrbNewSideState(); now = 0; now = prime(st, now);
 for (let i = 0; i < 3; i++) wbrbPolicyStep(st, 0.85, -20, now += 250, cfg);
 const enterAt = now;
 let relAt = null;
@@ -98,6 +102,46 @@ for (let i = 0; i < 30; i++) {
   if (v === 'release' && relAt === null) relAt = now - enterAt;
 }
 t('releases ~3.5s after feeds return', relAt >= 3500 && relAt <= 4000, '(at ' + relAt + 'ms)');
+
+console.log('\n— fingerprint: shared spectral tilt must not create false matches —');
+// v1.15.0 shipped a mean-centred fingerprint. Every natural audio signal carries a broad
+// downward tilt, so unrelated audio scored ~0.86 - the detector muted on anything and could
+// never release. These guard the fix.
+const tilt = (b) => -0.9 * b;
+const musicRaw = (ph) => Array.from({length:32}, (_, b) => tilt(b) + 6*Math.sin(b*0.9 + ph*0.7) + 4*Math.cos(b*0.35 - ph*0.4));
+const houseRaw = (x) => Array.from({length:32}, (_, b) => tilt(b) + 5*Math.exp(-Math.pow((b - (8 + 4*Math.sin(x*0.05)))/2.5, 2)));
+const oldFeat = wbrbNormalize, newFeat = wbrbDetrendNormalize;
+const oldScore = wbrbCosine(oldFeat(musicRaw(3)), oldFeat(houseRaw(40)));
+const newScore = wbrbCosine(newFeat(musicRaw(3)), newFeat(houseRaw(40)));
+t('the old feature really did confuse them (regression witness)', oldScore > 0.7,
+  '(mean-centred cos=' + oldScore.toFixed(3) + ')');
+t('detrended: unrelated audio scores below the continuation threshold', newScore < 0.66,
+  '(detrended cos=' + newScore.toFixed(3) + ')');
+t('detrended: the same music still self-matches', wbrbCosine(newFeat(musicRaw(5)), newFeat(musicRaw(5))) > 0.99);
+t('a pure tilt difference alone is neutralised',
+  Math.abs(wbrbCosine(newFeat(Array.from({length:32},(_,b)=>-0.9*b)), newFeat(Array.from({length:32},(_,b)=>-0.4*b)))) < 0.5);
+
+console.log('\n— policy: a duck can never latch permanently —');
+st = wbrbNewSideState(); now = 0; now = prime(st, now);
+for (let i = 0; i < 3; i++) wbrbPolicyStep(st, 0.85, -20, now += 250, cfg);
+t('ducked', st.active);
+let watchdogRel = null;
+const heldFrom = now;
+// score stays just above continuation but never reaches full confidence again, and the level
+// never drops - the exact shape of the reported stuck-mute
+for (let i = 0; i < 400 && watchdogRel === null; i++) {
+  const v = wbrbPolicyStep(st, 0.70, -20, now += 250, cfg);
+  if (v === 'release') watchdogRel = now - heldFrom;
+}
+t('watchdog releases without full-confidence evidence', watchdogRel !== null && watchdogRel <= 46000,
+  '(released after ' + (watchdogRel / 1000).toFixed(1) + 's)');
+
+console.log('\n— policy: baseline gate —');
+st = wbrbNewSideState(); now = 0;
+// a feed whose ordinary audio scores high must not end up permanently muted
+for (let i = 0; i < 200; i++) wbrbPolicyStep(st, 0.85, -20, now += 250, cfg);
+t('sustained high scores alone do not mute once they are the norm', !st.active,
+  '(baseline settled at ' + st.baseline.toFixed(2) + ')');
 
 console.log('\n— leveling gate —');
 t('true silence gets no boost', levelingGainDb(-70) === 0);
