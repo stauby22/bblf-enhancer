@@ -232,7 +232,7 @@ v 1.2
     const castImageBase = 'https://raw.githubusercontent.com/stauby22/bblf-enhancer/main/assets/cast/bb28/'
     const HOUSEGUESTS = ['Angela', 'Ashley', 'Barrett', 'Chuk', 'Dee', 'Drew', 'Haley', 'Jason', 'Kamu', 'Latrice', 'Lyric', 'Mallory', 'Melody', 'Rick', 'Rome', 'Taylor', 'Yash']
     // manual evictions - always grayed out, merged with the ones auto-remembered from stickies
-    const evictedHouseguests = ['Jason', 'Ashley', 'Lyric', 'Rome']
+    const evictedHouseguests = ['Jason', 'Ashley', 'Lyric', 'Rome','Chuk']
     // localStorage key where auto-detected evictions accumulate (clear it or bump per season)
     const evictedStoreKey = 'bblf_evicted_bb28'
     // sticky nickname -> cast name (the mod sticky uses nicknames for some houseguests)
