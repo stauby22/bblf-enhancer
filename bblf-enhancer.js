@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BBLF Enhancer
 // @namespace    http://tampermonkey.net/
-// @version      1.14.1
+// @version      1.15
 // @description  Monitor for issues on Big Brother Live Feed streams, reloading or starting video when necessary. Can autoload quad cam, add hotkeys, show video scrubber, and remap fullscreen button to only show video.
 // @author       liquid8d
 // @match        https://www.paramountplus.com/live-tv/stream/big_brother/*
@@ -14,6 +14,19 @@
 
 // ==/UserScript==
 /*
+v 1.15 (2026)
+ - audio engine rebuilt: source -> splitter -> [detector taps] -> trim -> level -> duck ->
+   fader matrix -> merger -> boost. stages park at unity when off; graph is never rewired
+ - automatic break (WBRB) muting, audio-only: 32-band normalized log-spectrum fingerprints
+   matched against a learned loop with a circular sequence search, per-side state machines,
+   fade-valley hold so the mute doesn't lift mid-break
+ - learn mode ('k' during a break, 45s) stores the profile in localStorage
+ - capture/replay harness: last 10 min of band vectors ring-buffered, 'C' dumps them,
+   window.bblfReplay(capture, {entry: 0.8}) re-runs the policy offline
+ - speech leveling (gated upward compression) and channel balance auto-trim, both frozen
+   while a side is ducked, both hard-capped
+ - continuous feed fader replaces 3-position pan; q/w/e are now jump-to-position
+ - detector HUD, new Settings rows, hotkeys: k learn, j toggle, K clear, C dump
 v 1.14.1 (2026)
  - hard-code BB28 evictions so far (Jason, Ashley, Lyric, Rome) in evictedHouseguests
 v 1.14 (2026)
@@ -151,7 +164,11 @@ v 1.2
         { key: '.', action: function() { playerSkip(seekLarge) } },
         { key: 'l', action: function() { playerGoLive() } },
         { key: 'p', action: function() { playerPip() } },
-        { key: 'm', action: function() { playerToggleMute() } }
+        { key: 'm', action: function() { playerToggleMute() } },
+        { key: 'k', action: function() { wbrbStartLearn() } },
+        { key: 'j', action: function() { wbrbToggle() } },
+        { key: 'K', action: function() { wbrbClearProfile() } },
+        { key: 'C', action: function() { wbrbDumpCapture() } }
     ]
 
     // force allow up to 1080p resolution
@@ -254,6 +271,78 @@ v 1.2
     // reset the 'retry' attempts in the script, if it is no longer working
     const resetScript = false
 
+    // --- audio engine ---
+    // Automatic break ("we'll be right back") muting. Detection is audio-only: the video
+    // frames are DRM-black to canvas, so there is no pixel evidence available to us.
+    const enableAutoMute = true
+    // gain a ducked side is pulled to (0 = silent; 0.05 leaves a faint hint of the break)
+    const wbrbDuckGain = 0.0
+    // duck fade time constant, seconds - an instantaneous gain change clicks audibly
+    const wbrbDuckRamp = 0.12
+    // analysis cadence (ms). learn mode records at this rate; changing it invalidates a profile
+    const wbrbFrameMs = 250
+    // frames in the match window. we have no visual corroboration, so this is longer than the
+    // 5-frame window a visually-assisted detector can afford. shorter = faster but jumpier
+    const wbrbWindowFrames = 12
+    // consecutive frames over the entry threshold before ducking. lower = quicker mute, more
+    // false positives; a false mute costs silence over live feeds, which is the cheaper error
+    const wbrbEntryConfirmations = 3
+    // cosine similarity that starts a duck. raise it if normal house audio ever trips the mute
+    const wbrbEntryThreshold = 0.74
+    // similarity that sustains a duck. MUST stay below entry or the duck chatters at the boundary
+    const wbrbContinueThreshold = 0.66
+    // how long continuation must fail before releasing (ms). too low and a break flickers
+    const wbrbReleaseGraceMs = 3500
+    // break music has deliberate quiet passages. if the level drops this far below the recent
+    // matched level, treat it as a fade valley and hold instead of starting the release timer -
+    // otherwise the mute lifts mid-break and the tail of the music hits at full volume
+    const wbrbFadeValleyDropDb = 6
+    // a valley can't hold the duck forever; past this the release timer runs regardless (ms)
+    const wbrbFadeValleyMaxMs = 7000
+    // L/R correlation above this means both sides carry identical audio (one feed on all panes).
+    // telemetry only - an untested signal should not be able to mute live audio
+    const wbrbDuplicateCorrelation = 0.93
+    // seconds of break music learn mode records
+    const wbrbLearnSeconds = 45
+    // fingerprint range/resolution
+    const wbrbMinHz = 80
+    const wbrbMaxHz = 8000
+    const wbrbBandCount = 32
+    // learned profile storage (bump per season - the break bed changes)
+    const wbrbProfileKey = 'bblf_wbrb_profile_bb28'
+    // capture ring buffer length for the replay harness (minutes)
+    const wbrbCaptureMinutes = 10
+
+    // channel balance auto-trim: pull a lopsided pair together. BOUNDED on purpose - without a
+    // cap, a genuinely one-sided moment (house asleep on one cam) gets "corrected" into
+    // amplified room tone
+    const enableBalanceTrim = false
+    const balanceMaxTrimDb = 6
+    // rolling window the per-side average is measured over (ms)
+    const balanceWindowMs = 10000
+    // when the quiet side becomes the loud one, adapt this many times faster so a stale trim
+    // reverses promptly instead of fighting the new imbalance
+    const balanceReversalSpeedup = 4
+
+    // speech leveling: upward compression with a gate, so 2am whispering comes up but silence
+    // doesn't get pumped
+    const enableLeveling = false
+    const levelTargetDb = -24
+    const levelMaxBoostDb = 12
+    const levelMaxCutDb = 6
+    // above this input level the gate is fully open
+    const levelGateDb = -52
+    // below this, no boost at all. between floor and gate the boost fades in, so genuine
+    // whispering still gets help while true silence does not
+    const levelWhisperFloorDb = -58
+    const levelSmoothing = 0.08
+
+    // HARD CAP on any automatically applied gain (dB). Do not raise this. Unbounded automatic
+    // boost on a live feed is a hearing-safety issue, not a tuning preference
+    const autoGainMaxDb = 12
+    // continuous feed fader: -1 = left cam in both ears, 0 = stereo, +1 = right cam in both
+    const faderRamp = 0.08
+
     // --- settings (Settings tab) ---
     // the consts above are defaults; anything changed in the panel's Settings tab is
     // stored in localStorage ('bblf_settings') and survives script updates
@@ -264,7 +353,11 @@ v 1.2
         hideGuideOverlay: hideGuideOverlay,
         showTransportBar: showTransportBar,
         showAudioControls: showAudioControls,
-        enableFeedStatus: enableFeedStatus
+        enableFeedStatus: enableFeedStatus,
+        autoMute: enableAutoMute,
+        leveling: enableLeveling,
+        balanceTrim: enableBalanceTrim,
+        detectorHud: false
     }
 
     // DO NOT MODIFY AFTER HERE
@@ -288,6 +381,8 @@ v 1.2
     let gainBoost = 1;
     let currentPan = 'none';
     let fsDefused = false;
+    // continuous fader position: -1 = left cam both ears, 0 = stereo, +1 = right cam both ears
+    let faderPosition = 0;
 
     // panel / reddit state
     let panelOpen = localStorage.getItem('bblf_panel_open') === '1';
@@ -307,7 +402,6 @@ v 1.2
 
     if (localStorage.getItem('bblf_video_monitor_attempts')) attempts = (resetScript) ? 0 : parseInt(localStorage.getItem('bblf_video_monitor_attempts'))
 
-    startup()
 
 	function startup() {
         log('starting bblf enhancer')
@@ -461,6 +555,7 @@ v 1.2
 						ensureStyles()
 						if (enablePanel) ensurePanel()
 						if (getSetting('theaterMode')) hidePlusLiveBadge()
+						audioEngineInit()
 						if (enablePlayerControls) updateTransportBar()
 						if (enableFullscreenHotkey && !fsDefused) defuseSmartTagFullscreen()
 						if (qualityFix) updateQualities()
@@ -502,67 +597,114 @@ v 1.2
         }
     }
 
+    // Signal chain, built once and never rewired (a settings toggle parks a stage at unity
+    // gain instead of touching connections):
+    //
+    //   source -> splitter -+-> [detector analysers L/R]   <- taps, pre-everything
+    //                       +-> trim -> level -> duck -> fader matrix -> merger -> boost -> out
+    //
+    // The detector taps hang off the splitter, NOT off the duck output. A post-duck tap goes
+    // deaf the instant it succeeds: mute, hear silence, conclude the break ended, unmute, hear
+    // the break, mute again - a three-second oscillation. Two extra connections avoid it, and
+    // tapping pre-trim/pre-level also keeps detection independent of our own gain changes.
+    // Do not "simplify" the tap location.
     function hookUpWebAudio(node) {
-        let audioNode = {};
-        audioNode.source = audioCtx.createMediaElementSource(node);
-		audioNode.merger = audioCtx.createChannelMerger(2);
-        audioNode.splitter = audioCtx.createChannelSplitter(2);
-        audioNode.source.connect(audioNode.splitter, 0, 0);
-        audioNode.gainLeft = audioCtx.createGain();
-        audioNode.gainRight = audioCtx.createGain();
-		audioNode.source.connect(audioNode.splitter, 0, 0);
-		audioNode.boost = audioCtx.createGain();
-		audioNode.boost.gain.value = gainBoost;
-		audioNode.merger.connect(audioNode.boost, 0, 0);
-		audioNode.boost.connect(audioCtx.destination);
-		audioNode.gainLeft.gain.value = 1;
-		audioNode.gainRight.gain.value = 1;
-        //audioNode.splitter.connect(audioNode.gainLeft, 0);
-        //audioNode.splitter.connect(audioNode.gainRight, 1);
-        //audioNode.gainLeft.connect(audioCtx.destination, 0);
-        //audioNode.gainRight.connect(audioCtx.destination, 0);
-        audioNodes.push(audioNode);
+        const a = {}
+        a.source = audioCtx.createMediaElementSource(node)
+        a.splitter = audioCtx.createChannelSplitter(2)
+        a.merger = audioCtx.createChannelMerger(2)
+        a.source.connect(a.splitter, 0, 0)
+
+        // detector taps
+        a.detectL = audioCtx.createAnalyser()
+        a.detectR = audioCtx.createAnalyser()
+        ;[a.detectL, a.detectR].forEach(function(an) {
+            an.fftSize = 2048
+            an.smoothingTimeConstant = 0.55
+            an.minDecibels = -110
+            an.maxDecibels = -10
+        })
+        a.splitter.connect(a.detectL, 0)
+        a.splitter.connect(a.detectR, 1)
+        a.freqL = new Float32Array(a.detectL.frequencyBinCount)
+        a.freqR = new Float32Array(a.detectR.frequencyBinCount)
+        a.timeL = new Float32Array(a.detectL.fftSize)
+        a.timeR = new Float32Array(a.detectR.fftSize)
+
+        // per-source-channel stages
+        a.trimLeft = audioCtx.createGain()
+        a.trimRight = audioCtx.createGain()
+        a.levelLeft = audioCtx.createGain()
+        a.levelRight = audioCtx.createGain()
+        // duck sits on the ORIGINAL source channel, before the fader. Ducking after the fader
+        // would leak break audio through whichever output gain is fed by the other channel
+        a.duckLeft = audioCtx.createGain()
+        a.duckRight = audioCtx.createGain()
+        ;[a.trimLeft, a.trimRight, a.levelLeft, a.levelRight, a.duckLeft, a.duckRight]
+            .forEach(function(g) { g.gain.value = 1 })
+        a.splitter.connect(a.trimLeft, 0)
+        a.splitter.connect(a.trimRight, 1)
+        a.trimLeft.connect(a.levelLeft)
+        a.trimRight.connect(a.levelRight)
+        a.levelLeft.connect(a.duckLeft)
+        a.levelRight.connect(a.duckRight)
+
+        // fader matrix: each source channel feeds both ears through its own gain
+        a.faderLL = audioCtx.createGain()
+        a.faderLR = audioCtx.createGain()
+        a.faderRL = audioCtx.createGain()
+        a.faderRR = audioCtx.createGain()
+        a.duckLeft.connect(a.faderLL)
+        a.duckLeft.connect(a.faderLR)
+        a.duckRight.connect(a.faderRL)
+        a.duckRight.connect(a.faderRR)
+        a.faderLL.connect(a.merger, 0, 0)
+        a.faderRL.connect(a.merger, 0, 0)
+        a.faderLR.connect(a.merger, 0, 1)
+        a.faderRR.connect(a.merger, 0, 1)
+
+        a.boost = audioCtx.createGain()
+        a.boost.gain.value = gainBoost
+        a.merger.connect(a.boost, 0, 0)
+        a.boost.connect(audioCtx.destination)
+
+        audioNodes.push(a)
+        applyFaderGains()
     }
 
-    function adjustChannel(dir) {
-        currentPan = dir
+    // fader gains for a position. at -1 the left source feeds both ears (the old 'left' pan),
+    // at +1 the right source does, at 0 it is untouched stereo
+    function faderGains(p) {
+        const t = Math.abs(p)
+        if (p <= 0) return { ll: 1, lr: t, rl: 0, rr: 1 - t }
+        return { ll: 1 - t, lr: 0, rl: t, rr: 1 }
+    }
+
+    function applyFaderGains() {
+        const g = faderGains(faderPosition)
+        const now = audioCtx.currentTime
+        audioNodes.forEach(function(a) {
+            if (!a.faderLL) return
+            a.faderLL.gain.setTargetAtTime(g.ll, now, faderRamp)
+            a.faderLR.gain.setTargetAtTime(g.lr, now, faderRamp)
+            a.faderRL.gain.setTargetAtTime(g.rl, now, faderRamp)
+            a.faderRR.gain.setTargetAtTime(g.rr, now, faderRamp)
+        })
+    }
+
+    function setFaderPosition(p) {
+        faderPosition = Math.max(-1, Math.min(1, p))
+        currentPan = (faderPosition <= -0.995) ? 'left'
+            : (faderPosition >= 0.995) ? 'right'
+            : (Math.abs(faderPosition) < 0.005) ? 'none' : 'mix'
+        applyFaderGains()
         updatePanUI()
-        audioNodes.forEach((audioNode) => {
-            if (dir === 'none') {
-				audioNode.gainLeft.disconnect();
-				audioNode.gainRight.disconnect();
-				audioNode.splitter.disconnect();
-				audioNode.gainLeft.connect(audioNode.merger, 0, 0);
-				audioNode.gainRight.connect(audioNode.merger, 0, 1);
-				audioNode.splitter.connect(audioNode.gainLeft, 0);
-				audioNode.splitter.connect(audioNode.gainRight, 1);
-				audioNode.gainLeft.gain.value = 1;
-				audioNode.gainRight.gain.value = 1;
-				log('audio balance reset');
-            } else if (dir === 'left') {
-				audioNode.gainLeft.disconnect();
-				audioNode.gainRight.disconnect();
-				audioNode.splitter.disconnect();
-				audioNode.gainLeft.connect(audioNode.merger, 0, 0);
-				audioNode.gainRight.connect(audioNode.merger, 0, 1);
-				audioNode.splitter.connect(audioNode.gainLeft, 0);
-				audioNode.splitter.connect(audioNode.gainRight, 0);
-				audioNode.gainLeft.gain.value = 1;
-				audioNode.gainRight.gain.value = 1;
-                log('audio balance left');
-            } else {
-				audioNode.gainLeft.disconnect();
-				audioNode.gainRight.disconnect();
-				audioNode.splitter.disconnect();
-				audioNode.gainLeft.connect(audioNode.merger, 0, 0);
-				audioNode.gainRight.connect(audioNode.merger, 0, 1);
-				audioNode.splitter.connect(audioNode.gainLeft, 1);
-				audioNode.splitter.connect(audioNode.gainRight, 1);
-				audioNode.gainLeft.gain.value = 1;
-				audioNode.gainRight.gain.value = 1;
-                log('audio balance right');
-            }
-        });
+        log('fader ' + faderPosition.toFixed(2) + ' (' + currentPan + ')')
+    }
+
+    // kept so the q/w/e hotkeys and the L/C/R buttons stay jump-to-position shortcuts
+    function adjustChannel(dir) {
+        setFaderPosition(dir === 'left' ? -1 : (dir === 'right' ? 1 : 0))
     }
 
     function ensureStyles() {
@@ -682,6 +824,524 @@ v 1.2
         log('gain boost: ' + gainBoost)
     }
 
+    // --- audio engine: detection, leveling, trim, harness ---
+    //
+    // Split into POLICY (pure, decides) and AUTHORITY (owns the sound). A policy can sustain a
+    // duck that already exists but never creates one - only fresh verified evidence acquires it.
+    // The detector is out of the signal path entirely: a detector bug can misjudge a break, but
+    // it cannot break audio.
+
+    let wbrbTimer = null
+    let wbrbProfile = null
+    let wbrbLearning = false
+    let wbrbLearnFrames = []
+    let wbrbCorrelation = 0
+    let wbrbCapture = []
+    const wbrbSide = { left: wbrbNewSideState(), right: wbrbNewSideState() }
+
+    function wbrbNewSideState() {
+        return {
+            recent: [], score: -1, confirmations: 0, active: false,
+            failingSince: 0, matchedLevelDb: -100, valleySince: 0, levelDb: -100,
+            levelGainDb: 0, avgDb: -100
+        }
+    }
+
+    // --- dsp (pure) ---
+
+    // mean-centre and scale to unit magnitude, making the feature a pure spectral SHAPE - a loud
+    // break and a quiet one produce the same vector, so matching is volume-independent
+    function wbrbNormalize(values) {
+        const n = values.length
+        if (!n) return []
+        var mean = 0
+        for (var i = 0; i < n; i++) mean += values[i]
+        mean /= n
+        const out = new Array(n)
+        var magSq = 0
+        for (var j = 0; j < n; j++) {
+            const v = values[j] - mean
+            out[j] = v
+            magSq += v * v
+        }
+        const mag = Math.sqrt(magSq)
+        if (mag < 1e-8) return out.fill(0)
+        for (var k = 0; k < n; k++) out[k] /= mag
+        return out
+    }
+
+    // collapse an FFT magnitude spectrum (dB) into log-spaced bands, summing in the POWER domain -
+    // averaging decibels understates the loudest bins in a band
+    function wbrbSpectrumToBands(freqDb, sampleRate, fftSize) {
+        const nyquist = sampleRate / 2
+        const maxHz = Math.min(wbrbMaxHz, nyquist)
+        const binsPerHz = fftSize / sampleRate
+        const ratio = maxHz / wbrbMinHz
+        const bands = new Array(wbrbBandCount)
+        for (var b = 0; b < wbrbBandCount; b++) {
+            const startHz = wbrbMinHz * Math.pow(ratio, b / wbrbBandCount)
+            const endHz = wbrbMinHz * Math.pow(ratio, (b + 1) / wbrbBandCount)
+            const startBin = Math.max(0, Math.min(freqDb.length - 1, Math.floor(startHz * binsPerHz)))
+            const endBin = Math.max(startBin + 1, Math.min(freqDb.length, Math.ceil(endHz * binsPerHz)))
+            var power = 0, count = 0
+            for (var bin = startBin; bin < endBin; bin++) {
+                const db = Number.isFinite(freqDb[bin]) ? freqDb[bin] : -120
+                power += Math.pow(10, db / 10)
+                count++
+            }
+            const meanPower = count > 0 ? power / count : 1e-12
+            bands[b] = 10 * Math.log10(Math.max(meanPower, 1e-12))
+        }
+        return wbrbNormalize(bands)
+    }
+
+    function wbrbCosine(a, b) {
+        if (!a || !b || a.length !== b.length) return -1
+        var dot = 0
+        for (var i = 0; i < a.length; i++) dot += a[i] * b[i]
+        return Math.max(-1, Math.min(1, dot))
+    }
+
+    // slide the recent window around the learned loop at every start offset, keep the best mean
+    // similarity. circular because a break joins the music partway through - it is a loop, not
+    // a track with a beginning
+    function wbrbSequenceMatch(learned, recent) {
+        if (!learned || !learned.length || !recent.length) return -1
+        const n = learned.length
+        var best = -1
+        for (var start = 0; start < n; start++) {
+            var total = 0
+            for (var i = 0; i < recent.length; i++) total += wbrbCosine(learned[(start + i) % n], recent[i])
+            const score = total / recent.length
+            if (score > best) best = score
+        }
+        return best
+    }
+
+    function wbrbRmsDb(samples) {
+        var sum = 0
+        for (var i = 0; i < samples.length; i++) sum += samples[i] * samples[i]
+        return 20 * Math.log10(Math.max(Math.sqrt(sum / samples.length), 1e-7))
+    }
+
+    // pearson correlation with a small lag search - two feeds carrying the same source can be a
+    // few ms apart
+    function wbrbLaggedCorrelation(left, right, maxLag, step) {
+        maxLag = maxLag || 480
+        step = step || 8
+        var best = 0
+        for (var lag = -maxLag; lag <= maxLag; lag += step) {
+            const s = Math.max(0, -lag)
+            const e = Math.min(left.length, right.length - lag)
+            if (e - s < 256) continue
+            var sumL = 0, sumR = 0
+            for (var i = s; i < e; i++) { sumL += left[i]; sumR += right[i + lag] }
+            const n = e - s
+            const mL = sumL / n, mR = sumR / n
+            var num = 0, dL = 0, dR = 0
+            for (var j = s; j < e; j++) {
+                const a = left[j] - mL, b = right[j + lag] - mR
+                num += a * b; dL += a * a; dR += b * b
+            }
+            const den = Math.sqrt(dL * dR)
+            if (den > 1e-9) best = Math.max(best, Math.abs(num / den))
+        }
+        return best
+    }
+
+    // --- policy (pure: no audio access, reused verbatim by the replay harness) ---
+
+    // returns 'enter' | 'release' | null, mutating only the passed state object
+    function wbrbPolicyStep(st, score, levelDb, now, cfg) {
+        st.score = score
+        st.levelDb = levelDb
+        if (!st.active) {
+            if (score >= cfg.entry) {
+                st.confirmations++
+                if (st.confirmations >= cfg.confirmations) {
+                    st.active = true
+                    st.failingSince = 0
+                    st.valleySince = 0
+                    st.matchedLevelDb = levelDb
+                    return 'enter'
+                }
+            } else {
+                st.confirmations = 0
+            }
+            return null
+        }
+        if (score >= cfg.continue_) {
+            st.failingSince = 0
+            st.valleySince = 0
+            // track the level of confidently-matched music so a valley is measurable against it
+            st.matchedLevelDb = st.matchedLevelDb * 0.88 + levelDb * 0.12
+            return null
+        }
+        const inValley = (st.matchedLevelDb - levelDb) >= cfg.valleyDropDb
+        if (inValley) {
+            if (!st.valleySince) st.valleySince = now
+            if (now - st.valleySince < cfg.valleyMaxMs) {
+                st.failingSince = 0
+                return null
+            }
+            // valley cap exceeded. credit the time already spent in the valley toward the
+            // grace, so a stuck valley tops out at valleyMaxMs instead of valleyMaxMs + graceMs
+            // (7s of silence over live feeds, not 10.5s)
+            if (!st.failingSince) st.failingSince = st.valleySince
+        } else if (!st.failingSince) {
+            st.failingSince = now
+        }
+        if (now - st.failingSince >= cfg.graceMs) {
+            st.active = false
+            st.confirmations = 0
+            st.failingSince = 0
+            st.valleySince = 0
+            return 'release'
+        }
+        return null
+    }
+
+    function wbrbConfig() {
+        return {
+            entry: wbrbEntryThreshold,
+            continue_: wbrbContinueThreshold,
+            confirmations: wbrbEntryConfirmations,
+            graceMs: wbrbReleaseGraceMs,
+            valleyDropDb: wbrbFadeValleyDropDb,
+            valleyMaxMs: wbrbFadeValleyMaxMs
+        }
+    }
+
+    // --- gain stages (pure math, applied by the authority below) ---
+
+    // upward compression toward a target with a gated floor. returns dB of gain to apply
+    function levelingGainDb(inputDb) {
+        var want = levelTargetDb - inputDb
+        want = Math.max(-levelMaxCutDb, Math.min(levelMaxBoostDb, want))
+        // fade the boost out between the whisper floor and the gate so whispers get help but
+        // true silence is never pumped
+        if (inputDb <= levelWhisperFloorDb) return 0
+        if (inputDb < levelGateDb && want > 0) {
+            const openness = (inputDb - levelWhisperFloorDb) / (levelGateDb - levelWhisperFloorDb)
+            want *= Math.max(0, Math.min(1, openness))
+        }
+        return Math.max(-autoGainMaxDb, Math.min(autoGainMaxDb, want))
+    }
+
+    function dbToGain(db) {
+        return Math.pow(10, Math.max(-autoGainMaxDb, Math.min(autoGainMaxDb, db)) / 20)
+    }
+
+    // --- authority: owns the duck, leveling and trim gains ---
+
+    function wbrbSetDuck(side, ducked) {
+        const target = ducked ? wbrbDuckGain : 1
+        const now = audioCtx.currentTime
+        audioNodes.forEach(function(a) {
+            const g = (side === 'left') ? a.duckLeft : a.duckRight
+            if (g) g.gain.setTargetAtTime(target, now, wbrbDuckRamp)
+        })
+    }
+
+    function applyStageGains() {
+        const now = audioCtx.currentTime
+        const levelOn = getSetting('leveling')
+        const trimOn = getSetting('balanceTrim')
+        audioNodes.forEach(function(a) {
+            if (!a.levelLeft) return
+            a.levelLeft.gain.setTargetAtTime(levelOn ? dbToGain(wbrbSide.left.levelGainDb) : 1, now, 0.25)
+            a.levelRight.gain.setTargetAtTime(levelOn ? dbToGain(wbrbSide.right.levelGainDb) : 1, now, 0.25)
+            a.trimLeft.gain.setTargetAtTime(trimOn ? dbToGain(balanceTrimDb.left) : 1, now, 0.5)
+            a.trimRight.gain.setTargetAtTime(trimOn ? dbToGain(balanceTrimDb.right) : 1, now, 0.5)
+        })
+    }
+
+    var balanceTrimDb = { left: 0, right: 0 }
+
+    function updateLevelingAndTrim() {
+        const L = wbrbSide.left, R = wbrbSide.right
+        const alpha = wbrbFrameMs / balanceWindowMs
+
+        ;['left', 'right'].forEach(function(key) {
+            const st = wbrbSide[key]
+            // FREEZE while ducked. Otherwise the ducked side reads as near-silence, leveling
+            // boosts toward max, and the accumulated boost lands on live audio the moment the
+            // duck releases - the unmute blasts the user, which is the exact failure this
+            // whole feature exists to prevent
+            if (st.active) return
+            st.avgDb = (st.avgDb <= -99) ? st.levelDb : st.avgDb * (1 - alpha) + st.levelDb * alpha
+            const want = levelingGainDb(st.levelDb)
+            st.levelGainDb = st.levelGainDb * (1 - levelSmoothing) + want * levelSmoothing
+        })
+
+        // balance trim also freezes while either side is ducked - a ducked channel reads quiet
+        // and the trim would "fix" the imbalance it just created
+        if (!L.active && !R.active) {
+            var diff = L.avgDb - R.avgDb
+            if (!Number.isFinite(diff)) diff = 0
+            diff = Math.max(-balanceMaxTrimDb, Math.min(balanceMaxTrimDb, diff))
+            const wantL = -diff / 2, wantR = diff / 2
+            // adapt faster when the correction reverses sign, so a stale trim doesn't fight a
+            // genuinely flipped imbalance
+            const reversing = (wantL * balanceTrimDb.left) < 0
+            const k = Math.min(1, alpha * (reversing ? balanceReversalSpeedup : 1))
+            balanceTrimDb.left = balanceTrimDb.left * (1 - k) + wantL * k
+            balanceTrimDb.right = balanceTrimDb.right * (1 - k) + wantR * k
+        }
+        applyStageGains()
+    }
+
+    // --- detector loop ---
+
+    function wbrbTick() {
+        if (!audioNodes.length) return
+        const a = audioNodes[0]
+        if (!a.detectL || !a.detectR) return
+        const now = Date.now()
+        const sr = audioCtx.sampleRate
+
+        const sides = [
+            { key: 'left', an: a.detectL, freq: a.freqL, time: a.timeL },
+            { key: 'right', an: a.detectR, freq: a.freqR, time: a.timeR }
+        ]
+        const bandsByKey = {}
+        sides.forEach(function(s) {
+            s.an.getFloatFrequencyData(s.freq)
+            s.an.getFloatTimeDomainData(s.time)
+            const st = wbrbSide[s.key]
+            st.levelDb = wbrbRmsDb(s.time)
+            bandsByKey[s.key] = wbrbSpectrumToBands(s.freq, sr, s.an.fftSize)
+            if (!wbrbLearning) {
+                st.recent.push(bandsByKey[s.key])
+                if (st.recent.length > wbrbWindowFrames) st.recent.shift()
+            }
+        })
+        wbrbCorrelation = wbrbLaggedCorrelation(a.timeL, a.timeR)
+
+        if (wbrbLearning) {
+            // record the louder side - that is the one carrying the break bed
+            const key = wbrbSide.left.levelDb >= wbrbSide.right.levelDb ? 'left' : 'right'
+            wbrbLearnFrames.push(bandsByKey[key])
+            if (wbrbLearnFrames.length >= Math.round((wbrbLearnSeconds * 1000) / wbrbFrameMs)) wbrbStopLearn(true)
+            wbrbUpdateHud()
+            return
+        }
+
+        const cfg = wbrbConfig()
+        const armed = getSetting('autoMute') && !!wbrbProfile
+        ;['left', 'right'].forEach(function(key) {
+            const st = wbrbSide[key]
+            if (st.recent.length < wbrbWindowFrames) return
+            const score = wbrbProfile ? wbrbSequenceMatch(wbrbProfile.frames, st.recent) : -1
+            if (!armed) {
+                st.score = score
+                // a disarmed detector must never hold a duck
+                if (st.active) { st.active = false; wbrbSetDuck(key, false) }
+                return
+            }
+            const verdict = wbrbPolicyStep(st, score, st.levelDb, now, cfg)
+            if (verdict === 'enter') {
+                wbrbSetDuck(key, true)
+                log('wbrb: ' + key + ' ducked (score ' + score.toFixed(3) + ')')
+                showSeekToast('break detected — ' + key + ' muted')
+            } else if (verdict === 'release') {
+                wbrbSetDuck(key, false)
+                log('wbrb: ' + key + ' released')
+                showSeekToast('feeds back — ' + key)
+            }
+        })
+
+        updateLevelingAndTrim()
+        wbrbRecordCapture(now, bandsByKey)
+        wbrbUpdateHud()
+    }
+
+    // --- replay harness ---
+    //
+    // Live breaks happen a few times a day on no schedule. Tuning against them directly gives
+    // about four iterations per day. Capture lets a threshold change be tested in one second
+    // against every break ever recorded, and doubles as regression coverage.
+
+    function wbrbRecordCapture(now, bandsByKey) {
+        const cap = Math.round((wbrbCaptureMinutes * 60 * 1000) / wbrbFrameMs)
+        const r3 = function(v) { return Math.round(v * 1000) / 1000 }
+        wbrbCapture.push({
+            t: now,
+            dbL: Math.round(wbrbSide.left.levelDb * 10) / 10,
+            dbR: Math.round(wbrbSide.right.levelDb * 10) / 10,
+            sL: r3(wbrbSide.left.score),
+            sR: r3(wbrbSide.right.score),
+            bL: bandsByKey.left.map(r3),
+            bR: bandsByKey.right.map(r3)
+        })
+        while (wbrbCapture.length > cap) wbrbCapture.shift()
+    }
+
+    function wbrbDumpCapture() {
+        const payload = {
+            createdAt: Date.now(),
+            frameMs: wbrbFrameMs,
+            bandCount: wbrbBandCount,
+            profileFrames: wbrbProfile ? wbrbProfile.frames.length : 0,
+            frames: wbrbCapture
+        }
+        const json = JSON.stringify(payload)
+        window.bblfLastCapture = payload
+        try {
+            navigator.clipboard.writeText(json)
+            showSeekToast('capture copied (' + wbrbCapture.length + ' frames)')
+        } catch (e) {
+            showSeekToast('capture at window.bblfLastCapture')
+        }
+        log('capture: ' + wbrbCapture.length + ' frames, also at window.bblfLastCapture')
+        return payload
+    }
+
+    // replay a capture through the same policy used live. overrides let a threshold be tested
+    // without touching the running detector: bblfReplay(window.bblfLastCapture, {entry: 0.8})
+    function wbrbReplay(data, overrides) {
+        if (!data || !data.frames || !data.frames.length) { console.warn('replay: no frames'); return null }
+        if (!wbrbProfile) { console.warn('replay: no learned profile to match against'); return null }
+        const cfg = Object.assign(wbrbConfig(), overrides || {})
+        const results = { transitions: [], frames: data.frames.length, cfg: cfg }
+        const state = { left: wbrbNewSideState(), right: wbrbNewSideState() }
+        const win = { left: [], right: [] }
+        const t0 = data.frames[0].t
+        data.frames.forEach(function(f) {
+            ;[['left', 'bL', 'dbL'], ['right', 'bR', 'dbR']].forEach(function(spec) {
+                const key = spec[0]
+                win[key].push(f[spec[1]])
+                if (win[key].length > wbrbWindowFrames) win[key].shift()
+                if (win[key].length < wbrbWindowFrames) return
+                const score = wbrbSequenceMatch(wbrbProfile.frames, win[key])
+                const v = wbrbPolicyStep(state[key], score, f[spec[2]], f.t, cfg)
+                if (v) {
+                    const rec = { at: ((f.t - t0) / 1000).toFixed(1) + 's', side: key, event: v, score: Math.round(score * 1000) / 1000 }
+                    results.transitions.push(rec)
+                    console.log('replay ' + rec.at + '  ' + key + '  ' + v + '  score ' + rec.score)
+                }
+            })
+        })
+        console.log('replay: ' + results.transitions.length + ' transitions over ' + results.frames + ' frames')
+        return results
+    }
+
+    // --- learn mode ---
+
+    function wbrbLoadProfile() {
+        try {
+            const raw = localStorage.getItem(wbrbProfileKey)
+            if (!raw) return null
+            const p = JSON.parse(raw)
+            if (!p || !Array.isArray(p.frames) || !p.frames.length) return null
+            return p
+        } catch (e) { return null }
+    }
+
+    function wbrbStartLearn() {
+        if (wbrbLearning) { wbrbStopLearn(false); return }
+        wbrbLearning = true
+        wbrbLearnFrames = []
+        // release any duck so we record the real signal, not our own silence
+        wbrbSetDuck('left', false)
+        wbrbSetDuck('right', false)
+        wbrbSide.left = wbrbNewSideState()
+        wbrbSide.right = wbrbNewSideState()
+        log('wbrb: learning for ' + wbrbLearnSeconds + 's - let the break music play')
+        showSeekToast('learning break music… ' + wbrbLearnSeconds + 's')
+    }
+
+    function wbrbStopLearn(save) {
+        wbrbLearning = false
+        if (save && wbrbLearnFrames.length > 20) {
+            const rounded = wbrbLearnFrames.map(function(f) { return f.map(function(v) { return Math.round(v * 1000) / 1000 }) })
+            const profile = { frames: rounded, createdAt: Date.now(), frameMs: wbrbFrameMs }
+            try {
+                localStorage.setItem(wbrbProfileKey, JSON.stringify(profile))
+                wbrbProfile = profile
+                log('wbrb profile saved: ' + rounded.length + ' frames')
+                showSeekToast('break profile saved (' + rounded.length + ' frames)')
+            } catch (e) {
+                warn('wbrb profile save failed: ' + e)
+                showSeekToast('profile save failed')
+            }
+        } else {
+            showSeekToast('learn cancelled')
+        }
+        wbrbLearnFrames = []
+        renderSettings()
+    }
+
+    function wbrbClearProfile() {
+        try { localStorage.removeItem(wbrbProfileKey) } catch (e) {}
+        wbrbProfile = null
+        wbrbSetDuck('left', false)
+        wbrbSetDuck('right', false)
+        wbrbSide.left = wbrbNewSideState()
+        wbrbSide.right = wbrbNewSideState()
+        showSeekToast('break profile cleared')
+        renderSettings()
+    }
+
+    function wbrbToggle() {
+        const on = !getSetting('autoMute')
+        setSetting('autoMute', on)
+        showSeekToast('auto-mute ' + (on ? 'on' : 'off'))
+        renderSettings()
+    }
+
+    // --- debug hud ---
+
+    function wbrbUpdateHud() {
+        const want = getSetting('detectorHud')
+        var hud = document.getElementById('bblf-wbrb-hud')
+        if (!want) {
+            if (hud) hud.parentNode.removeChild(hud)
+            return
+        }
+        if (!hud) {
+            const skin = document.querySelector('.aa-player-skin')
+            if (!skin) return
+            hud = document.createElement('div')
+            hud.id = 'bblf-wbrb-hud'
+            hud.style.cssText = 'position:absolute;top:12px;left:12px;z-index:2147483646;' +
+                'padding:7px 11px;border-radius:10px;background:rgba(28,28,30,0.72);' +
+                'backdrop-filter:blur(30px) saturate(180%);-webkit-backdrop-filter:blur(30px) saturate(180%);' +
+                'border:0.5px solid rgba(255,255,255,0.12);color:rgba(235,235,245,0.75);' +
+                'font:500 11px ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre;pointer-events:none;'
+            skin.appendChild(hud)
+        }
+        if (wbrbLearning) {
+            hud.style.color = '#ffd60a'
+            hud.textContent = 'LEARNING  ' + wbrbLearnFrames.length + ' / ' +
+                Math.round((wbrbLearnSeconds * 1000) / wbrbFrameMs)
+            return
+        }
+        const L = wbrbSide.left, R = wbrbSide.right
+        const fmt = function(v) { return (v >= 0 ? ' ' : '') + v.toFixed(3) }
+        const mark = function(st) { return st.active ? 'DUCK' : (st.confirmations ? '·' + st.confirmations + '  ' : '    ') }
+        hud.style.color = (L.active || R.active) ? '#ff453a' : 'rgba(235,235,245,0.75)'
+        hud.textContent =
+            'L ' + fmt(L.score) + ' ' + L.levelDb.toFixed(0).padStart(4) + 'dB ' + mark(L) +
+                ' lv' + L.levelGainDb.toFixed(1) + ' tr' + balanceTrimDb.left.toFixed(1) + '\n' +
+            'R ' + fmt(R.score) + ' ' + R.levelDb.toFixed(0).padStart(4) + 'dB ' + mark(R) +
+                ' lv' + R.levelGainDb.toFixed(1) + ' tr' + balanceTrimDb.right.toFixed(1) + '\n' +
+            'corr ' + wbrbCorrelation.toFixed(3) + (wbrbCorrelation >= wbrbDuplicateCorrelation ? ' DUP' : '') +
+            (wbrbProfile ? '' : '\nno profile — press k during a break')
+    }
+
+    function audioEngineInit() {
+        if (wbrbTimer) return
+        wbrbProfile = wbrbLoadProfile()
+        wbrbTimer = setInterval(wbrbTick, wbrbFrameMs)
+        // exposed for offline tuning from the console
+        window.bblfReplay = wbrbReplay
+        window.bblfDumpCapture = wbrbDumpCapture
+        log('audio engine started' + (wbrbProfile
+            ? ' (break profile: ' + wbrbProfile.frames.length + ' frames)'
+            : ' - no break profile, press k during a break to learn one'))
+    }
+
     // --- settings ---
 
     function getSetting(key) {
@@ -711,6 +1371,19 @@ v 1.2
                 })
             }
             ensureStyles()
+        } else if (key === 'autoMute') {
+            if (!getSetting('autoMute')) {
+                // a disabled detector must not leave a duck holding
+                wbrbSetDuck('left', false)
+                wbrbSetDuck('right', false)
+                wbrbSide.left = wbrbNewSideState()
+                wbrbSide.right = wbrbNewSideState()
+            }
+        } else if (key === 'leveling' || key === 'balanceTrim') {
+            if (key === 'balanceTrim' && !getSetting('balanceTrim')) balanceTrimDb = { left: 0, right: 0 }
+            applyStageGains()
+        } else if (key === 'detectorHud') {
+            wbrbUpdateHud()
         } else if (key === 'showTransportBar' || key === 'showAudioControls' || key === 'enableFeedStatus') {
             // drop the bar; the watchdog rebuilds it (if enabled) within 3s
             const bar = document.getElementById('bblf-transport')
@@ -775,6 +1448,27 @@ v 1.2
         mkRow('Transport bar', null, mkSwitch('showTransportBar'))
         mkRow('Audio controls in bar', 'pan + gain boost', mkSwitch('showAudioControls'))
         mkRow('Feed status', 'FeedBot up/down in the bar', mkSwitch('enableFeedStatus'))
+        mkRow('Auto-mute breaks', wbrbProfile
+            ? 'learned profile: ' + wbrbProfile.frames.length + ' frames'
+            : 'needs a profile — press k during a break', mkSwitch('autoMute'))
+        const profileBtns = document.createElement('div')
+        profileBtns.className = 'bblf-chips'
+        const learnBtn = document.createElement('button')
+        learnBtn.className = 'bblf-chip-btn'
+        learnBtn.textContent = wbrbLearning ? 'Stop' : 'Learn'
+        learnBtn.onclick = function() { wbrbStartLearn(); renderSettings() }
+        profileBtns.appendChild(learnBtn)
+        if (wbrbProfile) {
+            const clearBtn = document.createElement('button')
+            clearBtn.className = 'bblf-chip-btn'
+            clearBtn.textContent = 'Clear'
+            clearBtn.onclick = function() { wbrbClearProfile() }
+            profileBtns.appendChild(clearBtn)
+        }
+        mkRow('Break music profile', 'record ' + wbrbLearnSeconds + 's of break music', profileBtns)
+        mkRow('Speech leveling', 'bring whispers up, gate silence', mkSwitch('leveling'))
+        mkRow('Balance auto-trim', 'even out lopsided channels', mkSwitch('balanceTrim'))
+        mkRow('Detector HUD', 'match scores over the video', mkSwitch('detectorHud'))
         const foot = document.createElement('div')
         foot.style.cssText = 'padding:14px 16px;font-size:11px;color:rgba(235,235,245,0.45);display:flex;align-items:center;gap:10px;'
         const note = document.createElement('span')
@@ -991,6 +1685,17 @@ v 1.2
                     b.style.font = '600 12px -apple-system,BlinkMacSystemFont,sans-serif'
                     bar.appendChild(b)
                 })
+                const fader = document.createElement('input')
+                fader.id = 'bblf-fader'
+                fader.type = 'range'
+                fader.min = -1
+                fader.max = 1
+                fader.step = 0.05
+                fader.value = faderPosition
+                fader.title = 'feed fader: left cam ←→ right cam  (q / w / e)'
+                fader.style.cssText = 'width:64px;margin:0 4px;'
+                fader.oninput = function() { setFaderPosition(parseFloat(this.value)) }
+                bar.appendChild(fader)
                 const slider = document.createElement('input')
                 slider.id = 'bblf-gain-slider'
                 slider.type = 'range'
@@ -1677,6 +2382,8 @@ v 1.2
     function updatePanUI() {
         const bar = document.getElementById('bblf-transport')
         if (!bar) return
+        const fader = document.getElementById('bblf-fader')
+        if (fader && parseFloat(fader.value) !== faderPosition) fader.value = faderPosition
         bar.querySelectorAll('button[data-pan]').forEach(function(btn) {
             const active = btn.dataset.pan === currentPan
             btn.style.color = active ? '#30d158' : ''
@@ -1688,4 +2395,8 @@ v 1.2
     function warn(msg) { console.warn('BBLF Enhancer: (' + attempts + ') ' + msg) }
     function error(msg) { console.error('BBLF Enhancer: (' + attempts + ') ' + msg) }
     function info(msg) { console.info('BBLF Enhancer: (' + attempts + ') ' + msg) }
+    // start only after every declaration above has initialised - startup() used to run
+    // from the middle of this IIFE, which would hit the temporal dead zone the first time it
+    // touched anything declared below it
+    startup()
 })();
