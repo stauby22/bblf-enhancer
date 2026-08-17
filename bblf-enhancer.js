@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BBLF Enhancer
 // @namespace    http://tampermonkey.net/
-// @version      1.18.1
+// @version      1.18.2
 // @description  Monitor for issues on Big Brother Live Feed streams, reloading or starting video when necessary. Can autoload quad cam, add hotkeys, show video scrubber, and remap fullscreen button to only show video.
 // @author       liquid8d
 // @match        https://www.paramountplus.com/live-tv/stream/big_brother/*
@@ -14,6 +14,15 @@
 
 // ==/UserScript==
 /*
+v 1.18.2 (2026)
+ - a third capture caught steady continuous speech on one channel being muted: it sat at
+   level sd 5.4-6.8 against the bed's 2.7. Entry tightened to sd<=4.5 / pause<=0.10, which is
+   clean across all three recordings (0% false positives, no qualifying run of live audio at
+   all) at the cost of muting 81% rather than 89% of music - the sustain rule still holds a
+   mute once acquired
+ - FeedBot is now a second opinion. It screenshots the feeds and classifies them, which is the
+   pixel evidence a userscript cannot gather (Widevine reads back black). While it reports the
+   feeds up, entry needs 4s of evidence instead of 2s. It never blocks a mute, since it lags
 v 1.18.1 (2026)
  - the fast 'people are back' release now keys on GAPS between phrases rather than level
    movement: a bed's loop seam swings the level just as much as speech does, so the old test
@@ -380,8 +389,11 @@ v 1.2
     // ENTRY - all three must hold. Tightening these makes false mutes rarer and misses more
     // music; on the reference capture the longest run of live audio passing all three was 2
     // frames, against runs of 300+ frames during music
-    const musicMaxLevelSd = 6
-    const musicMaxPauseRatio = 0.15
+    // Tightened in v1.18.2 against a third capture where someone talked steadily on one
+    // channel: that speech sat at sd 5.4-6.8, while the bed sits at 2.7. 4.5 separates them
+    // with no overlap across all three recordings.
+    const musicMaxLevelSd = 4.5
+    const musicMaxPauseRatio = 0.10
     // the bed must be audible. Raising this misses quiet beds; lowering it lets a silent
     // house look like music again
     const musicMinLevelDb = -45
@@ -392,6 +404,14 @@ v 1.2
     const musicSustainSdMultiplier = 1.8
     // consecutive qualifying frames before ducking (8 * 250ms = 2s of evidence)
     const musicEnterFrames = 8
+    // FeedBot is an independent second opinion: it screenshots the feeds and classifies them,
+    // which is the pixel evidence a userscript cannot gather itself (Widevine reads back black).
+    // It lags by up to a poll interval, so it never blocks a mute - it just asks for more
+    // evidence while it still believes the feeds are live. Real break music clears the longer
+    // requirement in a second anyway.
+    const musicEnterFramesWhenFeedsUp = 16
+    // how long FeedBot must have reported 'up' before we treat it as corroboration
+    const feedsUpCorroborationMs = 180000
     // RELEASE, fast path: positive evidence that we are hearing PEOPLE again. The test is
     // GAPS, not level movement: conversation leaves real holes between phrases (~30% of frames
     // on the reference capture) while a bed does not (~15% even at its loop seams, where it
@@ -972,6 +992,8 @@ v 1.2
     let wbrbLrWindow = []
     let wbrbLr = 0
     let wbrbLastTickAt = 0
+    let feedStatus = null
+    let feedStatusSince = 0
     const wbrbSide = { left: wbrbNewSideState(), right: wbrbNewSideState() }
 
     function wbrbNewSideState() {
@@ -1232,6 +1254,13 @@ v 1.2
         return null
     }
 
+    // FeedBot has reported the feeds up for long enough that a break is unlikely to have
+    // started without it noticing
+    function feedsConfirmedUp() {
+        if (!getSetting('enableFeedStatus') || feedStatus !== 'up' || !feedStatusSince) return false
+        return (Date.now() - feedStatusSince) >= feedsUpCorroborationMs
+    }
+
     function wbrbConfig() {
         return {
             analysisFrames: wbrbAnalysisFrames,
@@ -1395,6 +1424,8 @@ v 1.2
             }
 
             const ev = wbrbEvidence(st.levels, wbrbLr, cfg)
+            // second opinion: while FeedBot still says the feeds are up, ask for more evidence
+            cfg.enterFrames = feedsConfirmedUp() ? musicEnterFramesWhenFeedsUp : musicEnterFrames
             if (!armed) {
                 if (st.active) {
                     st.active = false
@@ -1507,6 +1538,8 @@ v 1.2
         lines.push('detector: statistical (no profile needed)  autoMute ' + getSetting('autoMute'))
         lines.push('entry: sd<=' + musicMaxLevelSd + ' pause<=' + musicMaxPauseRatio +
             ' level>=' + musicMinLevelDb + 'dB for ' + musicEnterFrames + ' frames')
+        lines.push('feedbot: ' + (feedStatus || 'unknown') +
+            (feedsConfirmedUp() ? ' (corroborating live — entry needs ' + musicEnterFramesWhenFeedsUp + ' frames)' : ''))
         lines.push('release: people ' + (liveReleaseMs / 1000) + 's / quiet ' + (quietReleaseMs / 1000) +
             's / backstop ' + (wbrbMaxHoldWithoutStrongMs / 1000) + 's')
         lines.push('now: stereo ' + wbrbLr.toFixed(2) + '  L sd ' + wbrbSide.left.sd.toFixed(1) +
@@ -2180,6 +2213,8 @@ v 1.2
     }
 
     function renderFeedStatus(d, events) {
+        feedStatus = d.status
+        feedStatusSince = d.since * 1000
         const dot = document.getElementById('bblf-feeds-dot')
         const label = document.getElementById('bblf-feeds-label')
         const wrap = document.getElementById('bblf-feeds')

@@ -22,8 +22,8 @@ A Tampermonkey userscript that turns the **Big Brother US live feeds on Paramoun
 - **Automatic break muting** — no setup required: production's "we'll be right back" bed is
   recognised by its *character* rather than by matching a recording: a bed holds a rock-steady
   level, never pauses, and is audibly loud, while house conversation swings in level and leaves
-  real gaps between phrases. Measured against two real captures: 0% of live conversation muted,
-  99% and 77% of the breaks muted. Ducking is per channel, since a break can take
+  real gaps between phrases. Measured against three real captures: 0% of live audio muted
+  (including steady continuous speech), 99% and 77% of the breaks muted. Ducking is per channel, since a break can take
   one cam while the other stays live
 - **Speech leveling** (gated upward compression — 2am HOH whispering comes up, silence doesn't get
   pumped) and **channel balance auto-trim**, both bounded and both frozen while a side is muted
@@ -76,9 +76,11 @@ Once a year, in the config block at the top of the script:
 - This hooks Paramount+'s **internal, undocumented** player and DOM. It breaks when they change their site; expect to patch each season (the changelog in the script header is a history of exactly that).
 - Rewind depth = what your session has buffered. Paramount's server-side DVR window is only ~18 seconds, so nobody can seek before your page load — not this script, not the extension.
 - The Reddit reader uses your logged-in reddit.com session (via `GM_xmlhttpRequest`); logged-out requests may be blocked by Reddit.
-- Break detection is **audio-only** and needs a learned profile before it can do anything. Under
-  Widevine DRM the video frames read back as pure black to a userscript, so there is no visual
-  evidence available — the detector works from the music's spectral shape alone.
+- Break detection is **audio-only** and needs no setup. Under Widevine DRM the video frames read
+  back as pure black to a userscript, so no pixel evidence is available to us at all; [FeedBot]
+  (https://feedbot.liquid8d.dev/) does that analysis externally and is used here as a second
+  opinion — while it reports the feeds up, the detector asks for twice as much evidence before
+  muting. Detection is verified by replaying three real recordings in `tests/`.
 - Speech leveling and balance auto-trim ship **off**; they alter what you hear, so turn them on
   deliberately in Settings. Every automatic gain stage is hard-capped.
 - Unofficial fan project for personal use. Not affiliated with CBS, Paramount, or Reddit. Houseguest portraits are CBS promotional photography (credit embedded in the image files).

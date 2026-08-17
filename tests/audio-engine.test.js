@@ -8,9 +8,9 @@
 
 const src = require('fs').readFileSync(process.argv[2], 'utf8');
 const consts = `var wbrbBandCount=32, wbrbMinHz=80, wbrbMaxHz=8000,
- wbrbAnalysisFrames=20, musicMaxLevelSd=6, musicMaxPauseRatio=0.15,
+ wbrbAnalysisFrames=20, musicMaxLevelSd=4.5, musicMaxPauseRatio=0.10,
  musicMinLevelDb=-45, musicSustainMinLevelDb=-55,
- musicEnterFrames=8, musicSustainSdMultiplier=1.8,
+ musicEnterFrames=8, musicEnterFramesWhenFeedsUp=16, musicSustainSdMultiplier=1.8,
  liveMinPauseRatio=0.25,
  liveReleaseMs=2000, quietReleaseMs=12000, wbrbMaxHoldWithoutStrongMs=60000,
  levelTargetDb=-24, levelMaxBoostDb=12,
@@ -183,7 +183,8 @@ console.log('\n— REAL CAPTURE regressions —');
 // The detector is replayed against a genuine recording: live house conversation, then a long
 // break. This is the test that actually matters - muting conversation is the failure that
 // made this rewrite necessary.
-function replayFixture(name) {
+function replayFixture(name, which) {
+  const chan = which === 'right' ? 'right' : 'left';
   const fx = JSON.parse(require('fs').readFileSync(__dirname + '/fixtures/' + name, 'utf8'));
   const state = { left: wbrbNewSideState(), right: wbrbNewSideState() };
   let lrWin = [], lastTick = 0;
@@ -203,8 +204,8 @@ function replayFixture(name) {
       if (wbrbPolicyStep(s2, wbrbEvidence(s2.levels, lr, cfg), now, cfg)) flips++;
     });
     if (f.dbL < -100) return;
-    if (fx.labels.liveBefore !== undefined && secs < fx.labels.liveBefore) { liveN++; if (state.left.active) mutedLive++; }
-    else if (secs > fx.labels.musicAfter) { musicN++; if (state.left.active) mutedMusic++; }
+    if (fx.labels.liveBefore !== undefined && secs < fx.labels.liveBefore) { liveN++; if (state[chan].active) mutedLive++; }
+    else if (fx.labels.musicAfter !== undefined && secs > fx.labels.musicAfter) { musicN++; if (state[chan].active) mutedMusic++; }
   });
   return { livePct: liveN ? mutedLive / liveN * 100 : null, musicPct: musicN ? mutedMusic / musicN * 100 : null, flips };
 }
@@ -215,6 +216,10 @@ try {
   t('capture 1: the mute does not flicker', a.flips <= 8, '(' + a.flips + ' transitions in 30 min)');
   const b = replayFixture('capture-bb28-mono-bed.json');
   t('capture 2: the near-mono bed is detected', b.musicPct >= 70, '(' + b.musicPct.toFixed(1) + '% muted)');
+  const c = replayFixture('capture-bb28-steady-speech.json', 'right');
+  t('capture 3: steady continuous speech is never muted', c.livePct === 0, '(' + c.livePct.toFixed(1) + '% muted)');
+  const cL = replayFixture('capture-bb28-steady-speech.json', 'left');
+  t('capture 3: the other channel too', cL.livePct === 0, '(' + cL.livePct.toFixed(1) + '% muted)');
 } catch (e) {
   t('real-capture fixtures load', false, String(e.message));
 }
