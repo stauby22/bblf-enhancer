@@ -7,7 +7,7 @@
 // the mute for valleyMaxMs + graceMs (10.5s) instead of capping at valleyMaxMs (7s).
 
 const src = require('fs').readFileSync(process.argv[2], 'utf8');
-const consts = `var wbrbBandCount=32, wbrbEntryMarginOverBaseline=0.15, wbrbMaxHoldWithoutStrongMs=45000, wbrbMinHz=80, wbrbMaxHz=8000, wbrbEntryThreshold=0.74,
+const consts = `var wbrbBandCount=32, wbrbEntryMarginOverBaseline=0.15, wbrbMaxHoldWithoutStrongMs=45000, wbrbClearlyLiveThreshold=0.35, wbrbAmbiguousHoldMs=20000, wbrbMinHz=80, wbrbMaxHz=8000, wbrbEntryThreshold=0.74,
  wbrbContinueThreshold=0.66, wbrbEntryConfirmations=3, wbrbReleaseGraceMs=3500,
  wbrbFadeValleyDropDb=6, wbrbFadeValleyMaxMs=7000, levelTargetDb=-24, levelMaxBoostDb=12,
  levelMaxCutDb=6, levelGateDb=-52, levelWhisperFloorDb=-58, autoGainMaxDb=12;`;
@@ -78,17 +78,17 @@ st = wbrbNewSideState(); now = 0; now = prime(st, now);
 for (let i = 0; i < 3; i++) wbrbPolicyStep(st, 0.85, -20, now += 250, cfg);
 let released = null;
 for (let i = 0; i < 16; i++) {
-  const v = wbrbPolicyStep(st, 0.40, -30, now += 250, cfg);
+  const v = wbrbPolicyStep(st, 0.20, -30, now += 250, cfg);
   if (v === 'release') released = i * 250;
 }
 t('valley (>6dB drop) holds the mute past the 3.5s grace', st.active && released === null);
 let valleyRel = null;
 const valleyStart = now;
 for (let i = 0; i < 40; i++) {
-  const v = wbrbPolicyStep(st, 0.40, -30, now += 250, cfg);
+  const v = wbrbPolicyStep(st, 0.20, -30, now += 250, cfg);
   if (v === 'release' && valleyRel === null) valleyRel = now;
 }
-const heldMs = valleyRel - (valleyStart - 16 * 250);
+const heldMs = valleyRel === null ? Infinity : valleyRel - (valleyStart - 16 * 250);
 t('valley cannot latch forever — hold caps near 7s', !st.active && heldMs <= 7500,
   '(held ' + heldMs + 'ms)');
 
@@ -142,6 +142,43 @@ st = wbrbNewSideState(); now = 0;
 for (let i = 0; i < 200; i++) wbrbPolicyStep(st, 0.85, -20, now += 250, cfg);
 t('sustained high scores alone do not mute once they are the norm', !st.active,
   '(baseline settled at ' + st.baseline.toFixed(2) + ')');
+
+console.log('\n— policy: long break bed (the flicker) —');
+// An unlearned passage of the same bed scores in the ambiguous band. It must not unmute.
+st = wbrbNewSideState(); now = 0; now = prime(st, now);
+for (let i = 0; i < 3; i++) wbrbPolicyStep(st, 0.85, -20, now += 250, cfg);
+let flicker = null;
+for (let i = 0; i < 40; i++) {           // 10s of ambiguous (0.50), level steady
+  const v = wbrbPolicyStep(st, 0.50, -20, now += 250, cfg);
+  if (v === 'release' && flicker === null) flicker = i;
+}
+t('ambiguous passage does not unmute mid-break', st.active && flicker === null);
+for (let i = 0; i < 3; i++) wbrbPolicyStep(st, 0.85, -20, now += 250, cfg);  // learned part returns
+t('still ducked when the learned passage comes back around', st.active);
+
+console.log('\n— policy: feeds actually returning still releases promptly —');
+st = wbrbNewSideState(); now = 0; now = prime(st, now);
+for (let i = 0; i < 3; i++) wbrbPolicyStep(st, 0.85, -20, now += 250, cfg);
+const liveFrom = now;
+let liveRel = null;
+for (let i = 0; i < 40; i++) {           // house audio: clearly below clearlyLive
+  const v = wbrbPolicyStep(st, 0.15, -22, now += 250, cfg);
+  if (v === 'release' && liveRel === null) liveRel = now - liveFrom;
+}
+t('clearly-live audio releases on the normal grace', liveRel !== null && liveRel <= 4000,
+  '(released after ' + (liveRel / 1000).toFixed(1) + 's)');
+
+console.log('\n— policy: ambiguity cannot hold forever —');
+st = wbrbNewSideState(); now = 0; now = prime(st, now);
+for (let i = 0; i < 3; i++) wbrbPolicyStep(st, 0.85, -20, now += 250, cfg);
+const ambFrom = now;
+let ambRel = null;
+for (let i = 0; i < 400 && ambRel === null; i++) {
+  const v = wbrbPolicyStep(st, 0.50, -20, now += 250, cfg);
+  if (v === 'release') ambRel = now - ambFrom;
+}
+t('sustained ambiguity releases within the watchdog window', ambRel !== null && ambRel <= 46000,
+  '(released after ' + (ambRel / 1000).toFixed(1) + 's)');
 
 console.log('\n— leveling gate —');
 t('true silence gets no boost', levelingGainDb(-70) === 0);

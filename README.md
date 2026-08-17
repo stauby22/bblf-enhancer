@@ -22,7 +22,8 @@ A Tampermonkey userscript that turns the **Big Brother US live feeds on Paramoun
 - **Automatic break muting**: production's "we'll be right back" music bed is detected from its
   spectral signature and that side of the feed is ducked before it hits you — per channel, since
   a break can take one cam while the other stays live. Learn the bed once (`k` during a break) and
-  it's stored locally; no bundled fingerprint to go stale between seasons
+  it's stored locally, and learning is cumulative — each pass covers more of the bed, so a
+  couple of passes across different breaks builds full coverage
 - **Speech leveling** (gated upward compression — 2am HOH whispering comes up, silence doesn't get
   pumped) and **channel balance auto-trim**, both bounded and both frozen while a side is muted
 - **Continuous feed fader** — blend between the left and right cameras at any ratio, with `q`/`w`/`e`
@@ -58,6 +59,7 @@ A Tampermonkey userscript that turns the **Big Brother US live feeds on Paramoun
 | `j` | Toggle auto-mute |
 | `Shift`+`K` | Clear the learned break profile |
 | `Shift`+`C` | Dump the detector capture buffer (tuning) |
+| `Shift`+`D` | Print a detector diagnosis (scores, transitions) |
 
 ## New season setup
 

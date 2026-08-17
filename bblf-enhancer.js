@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BBLF Enhancer
 // @namespace    http://tampermonkey.net/
-// @version      1.15.1
+// @version      1.16
 // @description  Monitor for issues on Big Brother Live Feed streams, reloading or starting video when necessary. Can autoload quad cam, add hotkeys, show video scrubber, and remap fullscreen button to only show video.
 // @author       liquid8d
 // @match        https://www.paramountplus.com/live-tv/stream/big_brother/*
@@ -14,6 +14,15 @@
 
 // ==/UserScript==
 /*
+v 1.16 (2026)
+ - FIX for the mute flickering across a break: the bed is longer than one 45s learn pass, so
+   unlearned passages scored low and released mid-break
+   - learning is now CUMULATIVE: each pass is stored as its own segment and matched
+     separately, so a few passes across breaks build up coverage of the whole bed
+   - learn length is configurable (45s / 90s / 3m)
+   - two-tier release: clearly-live audio (below 0.35) releases on the normal grace, while
+     ambiguous scores hold for up to 20s rather than unmuting mid-break
+ - 'Shift+D' prints a compact, pasteable diagnosis (score percentiles, transitions, profile)
 v 1.15.1 (2026)
  - FIX: the fingerprint was dominated by the spectral tilt every natural audio signal shares,
    so unrelated house audio scored ~0.86 against a learned profile - above the entry threshold
@@ -178,7 +187,8 @@ v 1.2
         { key: 'k', action: function() { wbrbStartLearn() } },
         { key: 'j', action: function() { wbrbToggle() } },
         { key: 'K', action: function() { wbrbClearProfile() } },
-        { key: 'C', action: function() { wbrbDumpCapture() } }
+        { key: 'C', action: function() { wbrbDumpCapture() } },
+        { key: 'D', action: function() { wbrbDiagnose() } }
     ]
 
     // force allow up to 1080p resolution
@@ -312,8 +322,17 @@ v 1.2
     // L/R correlation above this means both sides carry identical audio (one feed on all panes).
     // telemetry only - an untested signal should not be able to mute live audio
     const wbrbDuplicateCorrelation = 0.93
-    // seconds of break music learn mode records
+    // seconds of break music one learn pass records. the bed is usually longer than this, so
+    // learning is CUMULATIVE - each pass is stored as its own segment and matched separately
     const wbrbLearnSeconds = 45
+    // stop the stored profile growing without bound (frames across all segments)
+    const wbrbMaxProfileFrames = 2400
+    // Below this the audio is clearly not the break bed (live house audio sits ~0.1-0.3), so
+    // release on the normal grace. Scores BETWEEN this and the continuation threshold are
+    // ambiguous - usually a passage of the same bed that was never learned - so hold instead
+    // of unmuting mid-break. This is what stops the mute flickering across a long bed.
+    const wbrbClearlyLiveThreshold = 0.35
+    const wbrbAmbiguousHoldMs = 20000
     // fingerprint range/resolution
     const wbrbMinHz = 80
     const wbrbMaxHz = 8000
@@ -377,7 +396,8 @@ v 1.2
         autoMute: enableAutoMute,
         leveling: enableLeveling,
         balanceTrim: enableBalanceTrim,
-        detectorHud: false
+        detectorHud: false,
+        learnSeconds: wbrbLearnSeconds
     }
 
     // DO NOT MODIFY AFTER HERE
@@ -857,13 +877,14 @@ v 1.2
     let wbrbLearnFrames = []
     let wbrbCorrelation = 0
     let wbrbCapture = []
+    let wbrbEvents = []
     const wbrbSide = { left: wbrbNewSideState(), right: wbrbNewSideState() }
 
     function wbrbNewSideState() {
         return {
             recent: [], score: -1, confirmations: 0, active: false,
             failingSince: 0, matchedLevelDb: -100, valleySince: 0, levelDb: -100,
-            levelGainDb: 0, avgDb: -100, baseline: -1, lastStrongAt: 0
+            levelGainDb: 0, avgDb: -100, baseline: -1, lastStrongAt: 0, ambiguousSince: 0
         }
     }
 
@@ -950,6 +971,28 @@ v 1.2
     // slide the recent window around the learned loop at every start offset, keep the best mean
     // similarity. circular because a break joins the music partway through - it is a loop, not
     // a track with a beginning
+    // A profile holds one segment per learn pass. Segments are matched separately rather than
+    // concatenated, so a window can never span the seam between two unrelated recordings.
+    function wbrbProfileSegments(profile) {
+        if (!profile) return []
+        if (Array.isArray(profile.segments)) return profile.segments
+        if (Array.isArray(profile.frames)) return [profile.frames]
+        return []
+    }
+
+    function wbrbProfileFrameCount(profile) {
+        return wbrbProfileSegments(profile).reduce(function(n, seg) { return n + seg.length }, 0)
+    }
+
+    function wbrbMatchProfile(profile, recent) {
+        var best = -1
+        wbrbProfileSegments(profile).forEach(function(seg) {
+            const s = wbrbSequenceMatch(seg, recent)
+            if (s > best) best = s
+        })
+        return best
+    }
+
     function wbrbSequenceMatch(learned, recent) {
         if (!learned || !learned.length || !recent.length) return -1
         const n = learned.length
@@ -1034,9 +1077,22 @@ v 1.2
         if (score >= cfg.continue_) {
             st.failingSince = 0
             st.valleySince = 0
+            st.ambiguousSince = 0
             // track the level of confidently-matched music so a valley is measurable against it
             st.matchedLevelDb = st.matchedLevelDb * 0.88 + levelDb * 0.12
             return null
+        }
+        // Ambiguous zone: too low to confirm, too high to be live house audio. Almost always a
+        // passage of the same bed that was not part of any learn pass. Hold - releasing here is
+        // what made the mute flicker on and off across a long break bed.
+        if (score >= cfg.clearlyLive) {
+            if (!st.ambiguousSince) st.ambiguousSince = now
+            if (now - st.ambiguousSince < cfg.ambiguousHoldMs) {
+                st.failingSince = 0
+                return null
+            }
+        } else {
+            st.ambiguousSince = 0
         }
         const inValley = (st.matchedLevelDb - levelDb) >= cfg.valleyDropDb
         if (inValley) {
@@ -1071,7 +1127,9 @@ v 1.2
             valleyDropDb: wbrbFadeValleyDropDb,
             valleyMaxMs: wbrbFadeValleyMaxMs,
             entryMargin: wbrbEntryMarginOverBaseline,
-            maxHoldWithoutStrongMs: wbrbMaxHoldWithoutStrongMs
+            maxHoldWithoutStrongMs: wbrbMaxHoldWithoutStrongMs,
+            clearlyLive: wbrbClearlyLiveThreshold,
+            ambiguousHoldMs: wbrbAmbiguousHoldMs
         }
     }
 
@@ -1185,7 +1243,7 @@ v 1.2
             // record the louder side - that is the one carrying the break bed
             const key = wbrbSide.left.levelDb >= wbrbSide.right.levelDb ? 'left' : 'right'
             wbrbLearnFrames.push(bandsByKey[key])
-            if (wbrbLearnFrames.length >= Math.round((wbrbLearnSeconds * 1000) / wbrbFrameMs)) wbrbStopLearn(true)
+            if (wbrbLearnFrames.length >= Math.round((getSetting('learnSeconds') * 1000) / wbrbFrameMs)) wbrbStopLearn(true)
             wbrbUpdateHud()
             return
         }
@@ -1195,7 +1253,7 @@ v 1.2
         ;['left', 'right'].forEach(function(key) {
             const st = wbrbSide[key]
             if (st.recent.length < wbrbWindowFrames) return
-            const score = wbrbProfile ? wbrbSequenceMatch(wbrbProfile.frames, st.recent) : -1
+            const score = wbrbProfile ? wbrbMatchProfile(wbrbProfile, st.recent) : -1
             if (!armed) {
                 st.score = score
                 // a disarmed detector must never hold a duck
@@ -1203,6 +1261,10 @@ v 1.2
                 return
             }
             const verdict = wbrbPolicyStep(st, score, st.levelDb, now, cfg)
+            if (verdict) {
+                wbrbEvents.push({ t: now, side: key, event: verdict, score: Math.round(score * 1000) / 1000 })
+                while (wbrbEvents.length > 200) wbrbEvents.shift()
+            }
             if (verdict === 'enter') {
                 wbrbSetDuck(key, true)
                 log('wbrb: ' + key + ' ducked (score ' + score.toFixed(3) + ')')
@@ -1260,6 +1322,59 @@ v 1.2
         return payload
     }
 
+    // Compact, pasteable summary of what the detector has been seeing. This is the thing to
+    // share when the detector misbehaves - it is small enough to paste, unlike a raw capture.
+    function wbrbDiagnose() {
+        const pct = function(arr, p) {
+            if (!arr.length) return NaN
+            const s = arr.slice().sort(function(a, b) { return a - b })
+            return s[Math.min(s.length - 1, Math.floor(s.length * p))]
+        }
+        const lines = []
+        const segs = wbrbProfileSegments(wbrbProfile)
+        lines.push('BBLF detector diagnosis')
+        lines.push('profile: ' + (wbrbProfile
+            ? segs.length + ' pass(es), ' + wbrbProfileFrameCount(wbrbProfile) + ' frames (' +
+              Math.round(wbrbProfileFrameCount(wbrbProfile) * wbrbFrameMs / 1000) + 's), feature ' +
+              (wbrbProfile.feature || '?') + ', segment lengths ' + segs.map(function(s) { return s.length }).join('/')
+            : 'NONE'))
+        lines.push('settings: entry ' + wbrbEntryThreshold + ' continue ' + wbrbContinueThreshold +
+            ' clearlyLive ' + wbrbClearlyLiveThreshold + ' window ' + wbrbWindowFrames +
+            ' learn ' + getSetting('learnSeconds') + 's autoMute ' + getSetting('autoMute'))
+        lines.push('capture: ' + wbrbCapture.length + ' frames (' +
+            Math.round(wbrbCapture.length * wbrbFrameMs / 1000) + 's)')
+        ;['L', 'R'].forEach(function(tag) {
+            const k = tag === 'L' ? 'sL' : 'sR'
+            const dk = tag === 'L' ? 'dbL' : 'dbR'
+            const scores = wbrbCapture.map(function(f) { return f[k] }).filter(function(v) { return v > -1 })
+            const levels = wbrbCapture.map(function(f) { return f[dk] })
+            if (!scores.length) { lines.push(tag + ': no scored frames yet'); return }
+            lines.push(tag + ' score  p10 ' + pct(scores, 0.1).toFixed(2) +
+                '  p50 ' + pct(scores, 0.5).toFixed(2) +
+                '  p90 ' + pct(scores, 0.9).toFixed(2) +
+                '  max ' + pct(scores, 0.999).toFixed(2) +
+                '   |  level p50 ' + pct(levels, 0.5).toFixed(0) + 'dB')
+            const above = function(th) { return (scores.filter(function(s) { return s >= th }).length / scores.length * 100).toFixed(0) + '%' }
+            lines.push(tag + '   above continue ' + above(wbrbContinueThreshold) +
+                ', above entry ' + above(wbrbEntryThreshold) +
+                ', below clearlyLive ' + (scores.filter(function(s) { return s < wbrbClearlyLiveThreshold }).length / scores.length * 100).toFixed(0) + '%')
+        })
+        if (wbrbEvents.length) {
+            const t0 = wbrbEvents[0].t
+            lines.push('transitions (' + wbrbEvents.length + '):')
+            wbrbEvents.slice(-24).forEach(function(e) {
+                lines.push('  +' + ((e.t - t0) / 1000).toFixed(1) + 's  ' + e.side + '  ' + e.event + '  score ' + e.score)
+            })
+        } else {
+            lines.push('transitions: none recorded')
+        }
+        const text = lines.join('\n')
+        console.log(text)
+        try { navigator.clipboard.writeText(text); showSeekToast('diagnosis copied to clipboard') }
+        catch (e) { showSeekToast('diagnosis printed to console') }
+        return text
+    }
+
     // replay a capture through the same policy used live. overrides let a threshold be tested
     // without touching the running detector: bblfReplay(window.bblfLastCapture, {entry: 0.8})
     function wbrbReplay(data, overrides) {
@@ -1296,7 +1411,9 @@ v 1.2
             const raw = localStorage.getItem(wbrbProfileKey)
             if (!raw) return null
             const p = JSON.parse(raw)
-            if (!p || !Array.isArray(p.frames) || !p.frames.length) return null
+            if (!p) return null
+            if (!Array.isArray(p.segments) && !Array.isArray(p.frames)) return null
+            if (!wbrbProfileFrameCount(p)) return null
             // a profile recorded with an older fingerprint cannot be compared against the
             // current one - drop it rather than matching in the wrong vector space
             if (p.feature !== wbrbFeatureVersion) {
@@ -1317,20 +1434,30 @@ v 1.2
         wbrbSetDuck('right', false)
         wbrbSide.left = wbrbNewSideState()
         wbrbSide.right = wbrbNewSideState()
-        log('wbrb: learning for ' + wbrbLearnSeconds + 's - let the break music play')
-        showSeekToast('learning break music… ' + wbrbLearnSeconds + 's')
+        log('wbrb: learning for ' + getSetting('learnSeconds') + 's - let the break music play')
+        showSeekToast('learning break music… ' + getSetting('learnSeconds') + 's (adds to profile)')
     }
 
     function wbrbStopLearn(save) {
         wbrbLearning = false
         if (save && wbrbLearnFrames.length > 20) {
             const rounded = wbrbLearnFrames.map(function(f) { return f.map(function(v) { return Math.round(v * 1000) / 1000 }) })
-            const profile = { frames: rounded, createdAt: Date.now(), frameMs: wbrbFrameMs, feature: wbrbFeatureVersion }
+            // append as a new segment: the bed is usually longer than one learn pass, so a few
+            // passes across different breaks build coverage instead of replacing each other
+            const segments = wbrbProfileSegments(wbrbProfile).slice()
+            segments.push(rounded)
+            var total = segments.reduce(function(n, s) { return n + s.length }, 0)
+            while (total > wbrbMaxProfileFrames && segments.length > 1) {
+                total -= segments.shift().length
+            }
+            const profile = { segments: segments, createdAt: Date.now(), frameMs: wbrbFrameMs, feature: wbrbFeatureVersion }
             try {
                 localStorage.setItem(wbrbProfileKey, JSON.stringify(profile))
                 wbrbProfile = profile
-                log('wbrb profile saved: ' + rounded.length + ' frames')
-                showSeekToast('break profile saved (' + rounded.length + ' frames)')
+                const n = wbrbProfileFrameCount(profile)
+                log('wbrb profile saved: ' + segments.length + ' segment(s), ' + n + ' frames')
+                showSeekToast('profile: ' + segments.length + ' pass(es), ' +
+                    Math.round(n * wbrbFrameMs / 1000) + 's of break music')
             } catch (e) {
                 warn('wbrb profile save failed: ' + e)
                 showSeekToast('profile save failed')
@@ -1384,7 +1511,7 @@ v 1.2
         if (wbrbLearning) {
             hud.style.color = '#ffd60a'
             hud.textContent = 'LEARNING  ' + wbrbLearnFrames.length + ' / ' +
-                Math.round((wbrbLearnSeconds * 1000) / wbrbFrameMs)
+                Math.round((getSetting('learnSeconds') * 1000) / wbrbFrameMs)
             return
         }
         const L = wbrbSide.left, R = wbrbSide.right
@@ -1409,6 +1536,7 @@ v 1.2
         // exposed for offline tuning from the console
         window.bblfReplay = wbrbReplay
         window.bblfDumpCapture = wbrbDumpCapture
+        window.bblfDiagnose = wbrbDiagnose
         log('audio engine started' + (wbrbProfile
             ? ' (break profile: ' + wbrbProfile.frames.length + ' frames)'
             : ' - no break profile, press k during a break to learn one'))
@@ -1521,8 +1649,11 @@ v 1.2
         mkRow('Audio controls in bar', 'pan + gain boost', mkSwitch('showAudioControls'))
         mkRow('Feed status', 'FeedBot up/down in the bar', mkSwitch('enableFeedStatus'))
         mkRow('Auto-mute breaks', wbrbProfile
-            ? 'learned profile: ' + wbrbProfile.frames.length + ' frames'
+            ? 'profile: ' + wbrbProfileSegments(wbrbProfile).length + ' pass(es), ' +
+              Math.round(wbrbProfileFrameCount(wbrbProfile) * wbrbFrameMs / 1000) + 's of music'
             : 'needs a profile — press k during a break', mkSwitch('autoMute'))
+        mkRow('Learn length', 'each pass adds to the profile',
+            mkChips('learnSeconds', [45, 90, 180], function(v) { return v >= 60 ? (v / 60) + 'm' : v + 's' }))
         const profileBtns = document.createElement('div')
         profileBtns.className = 'bblf-chips'
         const learnBtn = document.createElement('button')
@@ -1537,7 +1668,9 @@ v 1.2
             clearBtn.onclick = function() { wbrbClearProfile() }
             profileBtns.appendChild(clearBtn)
         }
-        mkRow('Break music profile', 'record ' + wbrbLearnSeconds + 's of break music', profileBtns)
+        mkRow('Break music profile', wbrbProfile
+            ? 'learn again during another break to cover more of the bed'
+            : 'press Learn during a break', profileBtns)
         mkRow('Speech leveling', 'bring whispers up, gate silence', mkSwitch('leveling'))
         mkRow('Balance auto-trim', 'even out lopsided channels', mkSwitch('balanceTrim'))
         mkRow('Detector HUD', 'match scores over the video', mkSwitch('detectorHud'))
