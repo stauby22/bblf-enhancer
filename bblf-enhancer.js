@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BBLF Enhancer
 // @namespace    http://tampermonkey.net/
-// @version      1.17
+// @version      1.18
 // @description  Monitor for issues on Big Brother Live Feed streams, reloading or starting video when necessary. Can autoload quad cam, add hotkeys, show video scrubber, and remap fullscreen button to only show video.
 // @author       liquid8d
 // @match        https://www.paramountplus.com/live-tv/stream/big_brother/*
@@ -14,6 +14,20 @@
 
 // ==/UserScript==
 /*
+v 1.18 (2026)
+ - Break detection rewritten from measurement of a real capture. Template matching against a
+   learned loop is retired as a decision input: the bed does NOT repeat (matching the music
+   against itself 30s later reaches only 0.67), so no profile could ever hold a mute.
+   Detection is now statistical and needs NO learning:
+     * level steady        music sd ~2.7dB vs conversation ~12dB
+     * no pauses           music ~0% vs conversation ~30% of frames
+     * channels DIFFER     stereo bed agreement ~0.16 vs two cams of a room ~0.78
+   On the reference capture: 0% of live audio muted, ~92% of break music muted.
+ - release now needs positive evidence that PEOPLE are back (channels agree and the level
+   moves) for 2s; absence of the bed alone waits 12s, which stops the mute flickering at the
+   bed's loop seams (13 flips in one break became 1)
+ - detector holds state through digital silence and through gaps in the tick clock
+ - learn mode kept but optional, feeding the HUD only
 v 1.17 (2026)
  - FIX for house conversation being muted: scoring searched the whole profile for its best
    offset, and the winner of a 360-way search scores high on any audio (measured on a real
@@ -309,6 +323,16 @@ v 1.2
     // --- audio engine ---
     // Automatic break ("we'll be right back") muting. Detection is audio-only: the video
     // frames are DRM-black to canvas, so there is no pixel evidence available to us.
+    //
+    // HOW IT DECIDES (rewritten in v1.18 after measuring a real capture): the break bed does
+    // NOT repeat - matching the music against itself 30s later only reaches 0.67, so template
+    // matching against a learned loop could never hold. What separates a bed from the house is
+    // its CHARACTER, and three cheap statistics do it cleanly on real data:
+    //   * level is rock steady        (music sd ~2.7 dB, live conversation ~12 dB)
+    //   * no pauses                   (music ~0%, conversation ~30% of frames in a gap)
+    //   * the two channels DIFFER     (a stereo bed: L/R agreement ~0.16; two cams of the same
+    //                                  room agree ~0.78 - this one is backwards from intuition)
+    // Measured on a real capture: 0% of live audio muted, ~92% of break music muted.
     const enableAutoMute = true
     // gain a ducked side is pulled to (0 = silent; 0.05 leaves a faint hint of the break)
     const wbrbDuckGain = 0.0
@@ -337,6 +361,30 @@ v 1.2
     // L/R correlation above this means both sides carry identical audio (one feed on all panes).
     // telemetry only - an untested signal should not be able to mute live audio
     const wbrbDuplicateCorrelation = 0.93
+    // frames in the rolling statistics window (20 * 250ms = 5s)
+    const wbrbAnalysisFrames = 20
+    // ENTRY - all three must hold. Tightening these makes false mutes rarer and misses more
+    // music; on the reference capture the longest run of live audio passing all three was 2
+    // frames, against runs of 300+ frames during music
+    const musicMaxLevelSd = 6
+    const musicMaxPauseRatio = 0.15
+    const musicMaxStereoAgreement = 0.45
+    // Hysteresis: a mute already held tolerates a livelier bed than it took to acquire one.
+    // Without this a channel whose level wanders (sd ~10) starts the release timer mid-break.
+    const musicSustainSdMultiplier = 1.8
+    // consecutive qualifying frames before ducking (8 * 250ms = 2s of evidence)
+    const musicEnterFrames = 8
+    // RELEASE, fast path: positive evidence that we are hearing PEOPLE again - the channels
+    // agree (both cams on the same room) and the level moves or has gaps
+    const liveMinStereoAgreement = 0.55
+    const liveMinLevelSd = 8
+    const liveMinPauseRatio = 0.20
+    const liveReleaseMs = 2000
+    // RELEASE, slow path: the bed stopped qualifying but nothing says people are back. Beds
+    // have transitions at their loop seams (the reference bed loops every ~62s and briefly
+    // breaks character there); releasing on 3.5s of that made the mute flicker 13 times in one
+    // break, where 12s flickers once
+    const quietReleaseMs = 12000
     // seconds of break music one learn pass records. the bed is usually longer than this, so
     // learning is CUMULATIVE - each pass is stored as its own segment and matched separately
     const wbrbLearnSeconds = 45
@@ -363,7 +411,7 @@ v 1.2
     // SAFETY NET: a duck may not be held longer than this without at least one frame at full
     // entry confidence. real break music is a loop and re-confirms constantly, so a genuine
     // multi-hour outage keeps renewing this; a duck stuck on live audio releases on its own
-    const wbrbMaxHoldWithoutStrongMs = 30000
+    const wbrbMaxHoldWithoutStrongMs = 60000
     // PHASE TRACKING - the thing that separates a real match from a coincidence.
     // Searching a 360-frame profile for the best-matching offset is a best-of-360 contest, and
     // the winner of 360 tries scores high on ANY audio (measured: unrelated audio reaches ~0.6
@@ -903,6 +951,9 @@ v 1.2
     let wbrbCorrelation = 0
     let wbrbCapture = []
     let wbrbEvents = []
+    let wbrbLrWindow = []
+    let wbrbLr = 0
+    let wbrbLastTickAt = 0
     const wbrbSide = { left: wbrbNewSideState(), right: wbrbNewSideState() }
 
     function wbrbNewSideState() {
@@ -910,7 +961,8 @@ v 1.2
             recent: [], score: -1, confirmations: 0, active: false,
             failingSince: 0, matchedLevelDb: -100, valleySince: 0, levelDb: -100,
             levelGainDb: 0, avgDb: -100, baseline: -1, lastStrongAt: 0, ambiguousSince: 0,
-            prevSeg: -1, prevOffset: -1, lockSeg: -1, lockOffset: -1
+            prevSeg: -1, prevOffset: -1, lockSeg: -1, lockOffset: -1,
+            levels: [], sd: 0, pause: 0, liveSince: 0, quietSince: 0
         }
     }
 
@@ -1090,30 +1142,47 @@ v 1.2
 
     // --- policy (pure: no audio access, reused verbatim by the replay harness) ---
 
-    // returns 'enter' | 'release' | null, mutating only the passed state object
-    function wbrbPolicyStep(st, score, levelDb, now, cfg, ev) {
-        st.score = score
-        st.levelDb = levelDb
-        // Only phase-coherent evidence renews the watchdog. Raw high scores arrive constantly
-        // on ordinary audio (best-of-N), and letting those renew it meant a stuck mute could
-        // never time out.
-        const coherent = !ev || ev.coherent !== false
-        if (score >= cfg.entry && coherent) st.lastStrongAt = now
+    // Rolling statistics for one side. Pure: takes levels and the shared stereo agreement.
+    function wbrbEvidence(levels, stereoAgreement, cfg) {
+        const n = levels.length
+        if (n < cfg.analysisFrames) return { valid: false, music: false, live: false, sd: 0, pause: 0 }
+        var mean = 0
+        for (var i = 0; i < n; i++) mean += levels[i]
+        mean /= n
+        var varSum = 0, quiet = 0
+        for (var j = 0; j < n; j++) {
+            const dv = levels[j] - mean
+            varSum += dv * dv
+            if (levels[j] < mean - 7) quiet++
+        }
+        const sd = Math.sqrt(varSum / n)
+        const pause = quiet / n
+        const music = sd <= cfg.musicMaxSd && pause <= cfg.musicMaxPause &&
+            stereoAgreement <= cfg.musicMaxStereo
+        // looser test used only to SUSTAIN an existing mute (see musicSustainSdMultiplier)
+        const musicSustain = sd <= cfg.musicMaxSd * cfg.sustainSdMult &&
+            pause <= cfg.musicMaxPause * 1.5 && stereoAgreement <= cfg.musicMaxStereo + 0.1
+        // positive evidence of people, not merely the absence of a bed
+        const live = stereoAgreement >= cfg.liveMinStereo &&
+            (sd >= cfg.liveMinSd || pause >= cfg.liveMinPause)
+        return { valid: true, music: music, musicSustain: musicSustain, live: live, sd: sd, pause: pause }
+    }
+
+    // returns 'enter' | 'release' | null, mutating only the passed state object.
+    // Pure policy - no audio access - so the replay harness runs it unchanged.
+    function wbrbPolicyStep(st, ev, now, cfg) {
+        if (!ev.valid) return null          // silence or a gap in the tick clock: decide nothing
+        st.sd = ev.sd
+        st.pause = ev.pause
+        if (ev.music) st.lastStrongAt = now
         if (!st.active) {
-            // Baseline of what this feed normally scores. Falls fast and rises slowly, so it
-            // tracks ordinary audio rather than being dragged up by a passing match.
-            if (st.baseline < 0) st.baseline = score
-            else st.baseline += (score < st.baseline ? 0.05 : 0.005) * (score - st.baseline)
-            const beatsBaseline = score >= st.baseline + cfg.entryMargin
-            if (score >= cfg.entry && beatsBaseline && coherent) {
+            if (ev.music) {
                 st.confirmations++
-                if (st.confirmations >= cfg.confirmations) {
+                if (st.confirmations >= cfg.enterFrames) {
                     st.active = true
-                    st.failingSince = 0
-                    st.valleySince = 0
-                    st.matchedLevelDb = levelDb
+                    st.liveSince = 0
+                    st.quietSince = 0
                     st.lastStrongAt = now
-                    if (ev) { st.lockSeg = ev.seg; st.lockOffset = ev.offset }
                     return 'enter'
                 }
             } else {
@@ -1121,54 +1190,26 @@ v 1.2
             }
             return null
         }
-        // SAFETY NET first: however confident the continuation logic feels, a duck that has not
-        // seen full entry-level evidence for this long is released. Never let a mute latch.
-        if (now - st.lastStrongAt >= cfg.maxHoldWithoutStrongMs) {
-            st.active = false
-            st.confirmations = 0
-            st.failingSince = 0
-            st.valleySince = 0
-            return 'release'
-        }
-        if (score >= cfg.continue_) {
-            st.failingSince = 0
-            st.valleySince = 0
-            st.ambiguousSince = 0
-            // track the level of confidently-matched music so a valley is measurable against it
-            st.matchedLevelDb = st.matchedLevelDb * 0.88 + levelDb * 0.12
-            return null
-        }
-        // Ambiguous zone: too low to confirm, too high to be live house audio. Almost always a
-        // passage of the same bed that was not part of any learn pass. Hold - releasing here is
-        // what made the mute flicker on and off across a long break bed.
-        if (score >= cfg.clearlyLive) {
-            if (!st.ambiguousSince) st.ambiguousSince = now
-            if (now - st.ambiguousSince < cfg.ambiguousHoldMs) {
-                st.failingSince = 0
-                return null
-            }
+        // held. two ways out, plus a backstop.
+        if (ev.live) {
+            if (!st.liveSince) st.liveSince = now
+            st.quietSince = 0
         } else {
-            st.ambiguousSince = 0
-        }
-        const inValley = (st.matchedLevelDb - levelDb) >= cfg.valleyDropDb
-        if (inValley) {
-            if (!st.valleySince) st.valleySince = now
-            if (now - st.valleySince < cfg.valleyMaxMs) {
-                st.failingSince = 0
-                return null
+            st.liveSince = 0
+            if (!ev.musicSustain) {
+                if (!st.quietSince) st.quietSince = now
+            } else {
+                st.quietSince = 0
             }
-            // valley cap exceeded. credit the time already spent in the valley toward the
-            // grace, so a stuck valley tops out at valleyMaxMs instead of valleyMaxMs + graceMs
-            // (7s of silence over live feeds, not 10.5s)
-            if (!st.failingSince) st.failingSince = st.valleySince
-        } else if (!st.failingSince) {
-            st.failingSince = now
         }
-        if (now - st.failingSince >= cfg.graceMs) {
+        const peopleAreBack = st.liveSince && (now - st.liveSince >= cfg.liveReleaseMs)
+        const bedStopped = st.quietSince && (now - st.quietSince >= cfg.quietReleaseMs)
+        const stuck = (now - st.lastStrongAt) >= cfg.maxHoldWithoutStrongMs
+        if (peopleAreBack || bedStopped || stuck) {
             st.active = false
             st.confirmations = 0
-            st.failingSince = 0
-            st.valleySince = 0
+            st.liveSince = 0
+            st.quietSince = 0
             return 'release'
         }
         return null
@@ -1176,16 +1217,18 @@ v 1.2
 
     function wbrbConfig() {
         return {
-            entry: wbrbEntryThreshold,
-            continue_: wbrbContinueThreshold,
-            confirmations: wbrbEntryConfirmations,
-            graceMs: wbrbReleaseGraceMs,
-            valleyDropDb: wbrbFadeValleyDropDb,
-            valleyMaxMs: wbrbFadeValleyMaxMs,
-            entryMargin: wbrbEntryMarginOverBaseline,
-            maxHoldWithoutStrongMs: wbrbMaxHoldWithoutStrongMs,
-            clearlyLive: wbrbClearlyLiveThreshold,
-            ambiguousHoldMs: wbrbAmbiguousHoldMs
+            analysisFrames: wbrbAnalysisFrames,
+            musicMaxSd: musicMaxLevelSd,
+            musicMaxPause: musicMaxPauseRatio,
+            musicMaxStereo: musicMaxStereoAgreement,
+            enterFrames: musicEnterFrames,
+            sustainSdMult: musicSustainSdMultiplier,
+            liveMinStereo: liveMinStereoAgreement,
+            liveMinSd: liveMinLevelSd,
+            liveMinPause: liveMinPauseRatio,
+            liveReleaseMs: liveReleaseMs,
+            quietReleaseMs: quietReleaseMs,
+            maxHoldWithoutStrongMs: wbrbMaxHoldWithoutStrongMs
         }
     }
 
@@ -1305,52 +1348,58 @@ v 1.2
         }
 
         const cfg = wbrbConfig()
-        const armed = getSetting('autoMute') && !!wbrbProfile
+        const armed = getSetting('autoMute')
+
+        // shared stereo agreement: how alike the two channels are right now
+        const lrNow = wbrbCosine(bandsByKey.left, bandsByKey.right)
+        wbrbLrWindow.push(lrNow)
+        while (wbrbLrWindow.length > wbrbAnalysisFrames) wbrbLrWindow.shift()
+        wbrbLr = wbrbLrWindow.reduce(function(a, b) { return a + b }, 0) / wbrbLrWindow.length
+
+        // a gap in the tick clock (backgrounded tab) makes the window span the wrong span of
+        // time; drop the history rather than judge on it
+        const gap = wbrbLastTickAt && (now - wbrbLastTickAt) > (wbrbFrameMs * 3)
+        wbrbLastTickAt = now
+
         ;['left', 'right'].forEach(function(key) {
             const st = wbrbSide[key]
-            if (st.recent.length < wbrbWindowFrames) return
-            var m = { best: -1, seg: -1, offset: -1, segLen: 0 }
-            if (wbrbProfile) {
-                m = st.active
-                    ? wbrbMatchLocked(wbrbProfile, st.recent, st.lockSeg, st.lockOffset + 1)
-                    : wbrbMatchProfile(wbrbProfile, st.recent)
-                if (m.best < 0 && st.active) m = wbrbMatchProfile(wbrbProfile, st.recent)
+            const silent = st.levelDb < -100
+            if (gap || silent) {
+                if (gap) { st.levels = []; wbrbLrWindow = [] }
+                // hold whatever state we are in; silence is neither music nor people
+                return
             }
-            const score = m.best
-            // did the winning offset advance by about one frame, as a real loop would?
-            var coherent = true
-            if (wbrbRequirePhaseCoherence && !st.active) {
-                if (st.prevSeg === m.seg && st.prevOffset >= 0 && m.segLen > 0) {
-                    const expected = (st.prevOffset + 1) % m.segLen
-                    var diff = Math.abs(m.offset - expected)
-                    diff = Math.min(diff, m.segLen - diff)
-                    coherent = diff <= wbrbPhaseTolerance
-                } else {
-                    coherent = false
-                }
-                st.prevSeg = m.seg
-                st.prevOffset = m.offset
+            st.levels.push(st.levelDb)
+            while (st.levels.length > wbrbAnalysisFrames) st.levels.shift()
+
+            // template score is telemetry only now - the bed does not repeat, so it cannot be
+            // trusted to hold or release a mute. Kept for the HUD and for diagnosis.
+            if (wbrbProfile && st.recent.length >= wbrbWindowFrames) {
+                st.score = wbrbMatchProfile(wbrbProfile, st.recent).best
             }
+
+            const ev = wbrbEvidence(st.levels, wbrbLr, cfg)
             if (!armed) {
-                st.score = score
-                // a disarmed detector must never hold a duck
                 if (st.active) {
                     st.active = false
                     wbrbSetDuck(key, false)
-                    wbrbEvents.push({ t: now, side: key, event: 'release (disarmed)', score: Math.round(score * 1000) / 1000 })
+                    wbrbEvents.push({ t: now, side: key, event: 'release (disarmed)', sd: Math.round(ev.sd * 10) / 10 })
                 }
                 return
             }
-            const verdict = wbrbPolicyStep(st, score, st.levelDb, now, cfg,
-                { coherent: coherent, seg: m.seg, offset: m.offset })
-            if (st.active) st.lockOffset = m.offset
+            const verdict = wbrbPolicyStep(st, ev, now, cfg)
             if (verdict) {
-                wbrbEvents.push({ t: now, side: key, event: verdict, score: Math.round(score * 1000) / 1000 })
+                wbrbEvents.push({
+                    t: now, side: key, event: verdict,
+                    sd: Math.round(ev.sd * 10) / 10,
+                    pause: Math.round(ev.pause * 100) / 100,
+                    lr: Math.round(wbrbLr * 100) / 100
+                })
                 while (wbrbEvents.length > 200) wbrbEvents.shift()
             }
             if (verdict === 'enter') {
                 wbrbSetDuck(key, true)
-                log('wbrb: ' + key + ' ducked (score ' + score.toFixed(3) + ')')
+                log('wbrb: ' + key + ' ducked (sd ' + ev.sd.toFixed(1) + ' pause ' + ev.pause.toFixed(2) + ' lr ' + wbrbLr.toFixed(2) + ')')
                 showSeekToast('break detected — ' + key + ' muted')
             } else if (verdict === 'release') {
                 wbrbSetDuck(key, false)
@@ -1379,6 +1428,9 @@ v 1.2
             dbR: Math.round(wbrbSide.right.levelDb * 10) / 10,
             sL: r3(wbrbSide.left.score),
             sR: r3(wbrbSide.right.score),
+            sdL: Math.round(wbrbSide.left.sd * 10) / 10,
+            sdR: Math.round(wbrbSide.right.sd * 10) / 10,
+            lr: r3(wbrbLr),
             bL: bandsByKey.left.map(r3),
             bR: bandsByKey.right.map(r3)
         })
@@ -1435,11 +1487,14 @@ v 1.2
               Math.round(wbrbProfileFrameCount(wbrbProfile) * wbrbFrameMs / 1000) + 's), feature ' +
               (wbrbProfile.feature || '?') + ', segment lengths ' + segs.map(function(s) { return s.length }).join('/')
             : 'NONE'))
-        lines.push('phase coherence: ' + (wbrbRequirePhaseCoherence ? 'on (tol ' + wbrbPhaseTolerance + ')' : 'OFF') +
-            '   confirmations ' + wbrbEntryConfirmations)
-        lines.push('settings: entry ' + wbrbEntryThreshold + ' continue ' + wbrbContinueThreshold +
-            ' clearlyLive ' + wbrbClearlyLiveThreshold + ' window ' + wbrbWindowFrames +
-            ' learn ' + getSetting('learnSeconds') + 's autoMute ' + getSetting('autoMute'))
+        lines.push('detector: statistical (no profile needed)  autoMute ' + getSetting('autoMute'))
+        lines.push('entry: sd<=' + musicMaxLevelSd + ' pause<=' + musicMaxPauseRatio +
+            ' stereo<=' + musicMaxStereoAgreement + ' for ' + musicEnterFrames + ' frames')
+        lines.push('release: people ' + (liveReleaseMs / 1000) + 's / quiet ' + (quietReleaseMs / 1000) +
+            's / backstop ' + (wbrbMaxHoldWithoutStrongMs / 1000) + 's')
+        lines.push('now: stereo ' + wbrbLr.toFixed(2) + '  L sd ' + wbrbSide.left.sd.toFixed(1) +
+            ' pause ' + wbrbSide.left.pause.toFixed(2) + '  R sd ' + wbrbSide.right.sd.toFixed(1) +
+            ' pause ' + wbrbSide.right.pause.toFixed(2))
         lines.push('capture: ' + wbrbCapture.length + ' frames (' +
             Math.round(wbrbCapture.length * wbrbFrameMs / 1000) + 's)')
         ;['L', 'R'].forEach(function(tag) {
@@ -1462,7 +1517,8 @@ v 1.2
             const t0 = wbrbEvents[0].t
             lines.push('transitions (' + wbrbEvents.length + '):')
             wbrbEvents.slice(-24).forEach(function(e) {
-                lines.push('  +' + ((e.t - t0) / 1000).toFixed(1) + 's  ' + e.side + '  ' + e.event + '  score ' + e.score)
+                lines.push('  +' + ((e.t - t0) / 1000).toFixed(1) + 's  ' + e.side + '  ' + e.event +
+                    (e.sd !== undefined ? '  sd ' + e.sd + ' pause ' + e.pause + ' stereo ' + e.lr : ''))
             })
         } else {
             lines.push('transitions: none recorded')
@@ -1647,18 +1703,15 @@ v 1.2
             return
         }
         const L = wbrbSide.left, R = wbrbSide.right
-        const fmt = function(v) { return (v >= 0 ? ' ' : '') + v.toFixed(3) }
-        const mark = function(st) { return st.active ? 'DUCK' : (st.confirmations ? '·' + st.confirmations + '  ' : '    ') }
+        const mark = function(st) { return st.active ? 'DUCK' : (st.confirmations ? '\u00b7' + st.confirmations + '  ' : '    ') }
         hud.style.color = (L.active || R.active) ? '#ff453a' : 'rgba(235,235,245,0.75)'
         hud.textContent =
-            'L ' + fmt(L.score) + ' ' + L.levelDb.toFixed(0).padStart(4) + 'dB ' + mark(L) +
-                ' lv' + L.levelGainDb.toFixed(1) + ' tr' + balanceTrimDb.left.toFixed(1) + '\n' +
-            'R ' + fmt(R.score) + ' ' + R.levelDb.toFixed(0).padStart(4) + 'dB ' + mark(R) +
-                ' lv' + R.levelGainDb.toFixed(1) + ' tr' + balanceTrimDb.right.toFixed(1) + '\n' +
-            'base ' + (L.baseline < 0 ? '—' : L.baseline.toFixed(2)) + '/' +
-                (R.baseline < 0 ? '—' : R.baseline.toFixed(2)) +
-            '  corr ' + wbrbCorrelation.toFixed(3) + (wbrbCorrelation >= wbrbDuplicateCorrelation ? ' DUP' : '') +
-            (wbrbProfile ? '' : '\nno profile — press k during a break')
+            'L sd' + L.sd.toFixed(1).padStart(5) + ' pause' + L.pause.toFixed(2).padStart(5) +
+                L.levelDb.toFixed(0).padStart(5) + 'dB ' + mark(L) + '\n' +
+            'R sd' + R.sd.toFixed(1).padStart(5) + ' pause' + R.pause.toFixed(2).padStart(5) +
+                R.levelDb.toFixed(0).padStart(5) + 'dB ' + mark(R) + '\n' +
+            'stereo ' + wbrbLr.toFixed(2) + (wbrbLr <= musicMaxStereoAgreement ? ' wide(bed)' : (wbrbLr >= liveMinStereoAgreement ? ' agree(people)' : '')) +
+            (wbrbProfile ? '  tmpl ' + Math.max(0, L.score).toFixed(2) : '')
     }
 
     function audioEngineInit() {
@@ -1780,12 +1833,7 @@ v 1.2
         mkRow('Transport bar', null, mkSwitch('showTransportBar'))
         mkRow('Audio controls in bar', 'pan + gain boost', mkSwitch('showAudioControls'))
         mkRow('Feed status', 'FeedBot up/down in the bar', mkSwitch('enableFeedStatus'))
-        mkRow('Auto-mute breaks', wbrbProfile
-            ? 'profile: ' + wbrbProfileSegments(wbrbProfile).length + ' pass(es), ' +
-              Math.round(wbrbProfileFrameCount(wbrbProfile) * wbrbFrameMs / 1000) + 's of music'
-            : 'needs a profile — press k during a break', mkSwitch('autoMute'))
-        mkRow('Learn length', 'each pass adds to the profile',
-            mkChips('learnSeconds', [45, 90, 180], function(v) { return v >= 60 ? (v / 60) + 'm' : v + 's' }))
+        mkRow('Auto-mute breaks', 'detects the break bed by ear — no setup needed', mkSwitch('autoMute'))
         const profileBtns = document.createElement('div')
         profileBtns.className = 'bblf-chips'
         const learnBtn = document.createElement('button')
@@ -1800,9 +1848,7 @@ v 1.2
             clearBtn.onclick = function() { wbrbClearProfile() }
             profileBtns.appendChild(clearBtn)
         }
-        mkRow('Break music profile', wbrbProfile
-            ? 'learn again during another break to cover more of the bed'
-            : 'press Learn during a break', profileBtns)
+        mkRow('Break music profile', 'optional, telemetry only — the bed does not repeat', profileBtns)
         mkRow('Speech leveling', 'bring whispers up, gate silence', mkSwitch('leveling'))
         mkRow('Balance auto-trim', 'even out lopsided channels', mkSwitch('balanceTrim'))
         mkRow('Detector HUD', 'match scores over the video', mkSwitch('detectorHud'))

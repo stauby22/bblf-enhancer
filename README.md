@@ -19,11 +19,12 @@ A Tampermonkey userscript that turns the **Big Brother US live feeds on Paramoun
   - **House** — cast wall with portraits and badges (👑 HOH, NOM, V·POV, SAVED, HAVE-NOT, BBB, OUT), auto-parsed from the mod sticky in the discussion thread; evictions are remembered in localStorage for the rest of the season
   - **Settings** — refresh rate, quality, theater mode, and UI toggles, persisted in localStorage so they survive script updates
 - **Theater mode**: locks page scrolling and hides Paramount's chrome (slide-in header, footer, hover gradients, their LIVE badge)
-- **Automatic break muting**: production's "we'll be right back" music bed is detected from its
-  spectral signature and that side of the feed is ducked before it hits you — per channel, since
-  a break can take one cam while the other stays live. Learn the bed once (`k` during a break) and
-  it's stored locally, and learning is cumulative — each pass covers more of the bed, so a
-  couple of passes across different breaks builds full coverage
+- **Automatic break muting** — no setup required: production's "we'll be right back" bed is
+  recognised by its *character* rather than by matching a recording. A bed holds a rock-steady
+  level, never pauses, and is a wide stereo mix; house conversation swings in level, has gaps,
+  and reads nearly identical on both channels. Measured against a real capture: 0% of live
+  conversation muted, ~93% of the break muted. Ducking is per channel, since a break can take
+  one cam while the other stays live
 - **Speech leveling** (gated upward compression — 2am HOH whispering comes up, silence doesn't get
   pumped) and **channel balance auto-trim**, both bounded and both frozen while a side is muted
 - **Continuous feed fader** — blend between the left and right cameras at any ratio, with `q`/`w`/`e`
@@ -55,8 +56,8 @@ A Tampermonkey userscript that turns the **Big Brother US live feeds on Paramoun
 | `q` / `w` / `e` | Audio pan left / center / right |
 | `[` / `]` | Gain boost down / up |
 | `r` | Toggle sidebar panel |
-| `k` | Learn break music (45s, during a break) |
 | `j` | Toggle auto-mute |
+| `k` | Learn break music (optional, telemetry only) |
 | `Shift`+`K` | Clear the learned break profile |
 | `Shift`+`C` | Save a detector capture file (tuning) |
 | `Shift`+`D` | Print a detector diagnosis (scores, transitions) |
