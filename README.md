@@ -58,7 +58,7 @@ A Tampermonkey userscript that turns the **Big Brother US live feeds on Paramoun
 | `k` | Learn break music (45s, during a break) |
 | `j` | Toggle auto-mute |
 | `Shift`+`K` | Clear the learned break profile |
-| `Shift`+`C` | Dump the detector capture buffer (tuning) |
+| `Shift`+`C` | Save a detector capture file (tuning) |
 | `Shift`+`D` | Print a detector diagnosis (scores, transitions) |
 
 ## New season setup

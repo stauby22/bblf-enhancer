@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BBLF Enhancer
 // @namespace    http://tampermonkey.net/
-// @version      1.16
+// @version      1.17
 // @description  Monitor for issues on Big Brother Live Feed streams, reloading or starting video when necessary. Can autoload quad cam, add hotkeys, show video scrubber, and remap fullscreen button to only show video.
 // @author       liquid8d
 // @match        https://www.paramountplus.com/live-tv/stream/big_brother/*
@@ -14,6 +14,21 @@
 
 // ==/UserScript==
 /*
+v 1.17 (2026)
+ - FIX for house conversation being muted: scoring searched the whole profile for its best
+   offset, and the winner of a 360-way search scores high on any audio (measured on a real
+   capture: 13% of live frames cleared the entry threshold, which also kept the release
+   watchdog permanently renewed). Matching is now phase-aware:
+   - acquisition requires the winning offset to ADVANCE about one frame per tick, the way a
+     real loop does; a coincidence lands somewhere unrelated each time and is rejected
+   - once ducked, matching is locked to where the music should have advanced to (best-of-5,
+     not best-of-360), so continuation scores are honest and releases actually happen
+   - only phase-coherent frames renew the release watchdog
+ - learn passes are trimmed: frames at the head/tail that never recur are dropped, since a
+   pass usually catches live audio before or after the bed - and those frames are exactly
+   what made voices match
+ - entry 0.78 / 5 confirmations / 30s watchdog
+ - Shift+C now saves a capture FILE (with the profile embedded) for offline calibration
 v 1.16 (2026)
  - FIX for the mute flickering across a break: the bed is longer than one 45s learn pass, so
    unlearned passages scored low and released mid-break
@@ -306,9 +321,9 @@ v 1.2
     const wbrbWindowFrames = 12
     // consecutive frames over the entry threshold before ducking. lower = quicker mute, more
     // false positives; a false mute costs silence over live feeds, which is the cheaper error
-    const wbrbEntryConfirmations = 3
+    const wbrbEntryConfirmations = 5
     // cosine similarity that starts a duck. raise it if normal house audio ever trips the mute
-    const wbrbEntryThreshold = 0.74
+    const wbrbEntryThreshold = 0.78
     // similarity that sustains a duck. MUST stay below entry or the duck chatters at the boundary
     const wbrbContinueThreshold = 0.66
     // how long continuation must fail before releasing (ms). too low and a break flickers
@@ -348,7 +363,17 @@ v 1.2
     // SAFETY NET: a duck may not be held longer than this without at least one frame at full
     // entry confidence. real break music is a loop and re-confirms constantly, so a genuine
     // multi-hour outage keeps renewing this; a duck stuck on live audio releases on its own
-    const wbrbMaxHoldWithoutStrongMs = 45000
+    const wbrbMaxHoldWithoutStrongMs = 30000
+    // PHASE TRACKING - the thing that separates a real match from a coincidence.
+    // Searching a 360-frame profile for the best-matching offset is a best-of-360 contest, and
+    // the winner of 360 tries scores high on ANY audio (measured: unrelated audio reaches ~0.6
+    // median, ~0.77 at p90 - which is how house conversation ended up muted). But a genuine
+    // match walks forward through the loop one frame per tick, while a coincidence lands on an
+    // unrelated offset each time. Requiring the winning offset to ADVANCE costs nothing in
+    // sensitivity and rejects almost all chance matches.
+    const wbrbRequirePhaseCoherence = true
+    // how far the winning offset may drift from 'previous + 1' and still count as advancing
+    const wbrbPhaseTolerance = 2
     // capture ring buffer length for the replay harness (minutes)
     const wbrbCaptureMinutes = 10
 
@@ -884,7 +909,8 @@ v 1.2
         return {
             recent: [], score: -1, confirmations: 0, active: false,
             failingSince: 0, matchedLevelDb: -100, valleySince: 0, levelDb: -100,
-            levelGainDb: 0, avgDb: -100, baseline: -1, lastStrongAt: 0, ambiguousSince: 0
+            levelGainDb: 0, avgDb: -100, baseline: -1, lastStrongAt: 0, ambiguousSince: 0,
+            prevSeg: -1, prevOffset: -1, lockSeg: -1, lockOffset: -1
         }
     }
 
@@ -984,13 +1010,38 @@ v 1.2
         return wbrbProfileSegments(profile).reduce(function(n, seg) { return n + seg.length }, 0)
     }
 
+    // global search: best offset across every segment. Used only to ACQUIRE a match.
     function wbrbMatchProfile(profile, recent) {
-        var best = -1
-        wbrbProfileSegments(profile).forEach(function(seg) {
-            const s = wbrbSequenceMatch(seg, recent)
-            if (s > best) best = s
+        var best = -1, bestSeg = -1, bestOffset = -1, bestLen = 0
+        wbrbProfileSegments(profile).forEach(function(seg, si) {
+            const n = seg.length
+            for (var s = 0; s < n; s++) {
+                var total = 0
+                for (var i = 0; i < recent.length; i++) total += wbrbCosine(seg[(s + i) % n], recent[i])
+                const score = total / recent.length
+                if (score > best) { best = score; bestSeg = si; bestOffset = s; bestLen = n }
+            }
         })
-        return best
+        return { best: best, seg: bestSeg, offset: bestOffset, segLen: bestLen }
+    }
+
+    // locked search: once a match is held, only look where the music should have advanced to.
+    // This is a best-of-5 rather than best-of-360, so the continuation score is honest and a
+    // mute actually falls below the threshold when the break ends.
+    function wbrbMatchLocked(profile, recent, segIndex, expectedOffset) {
+        const segs = wbrbProfileSegments(profile)
+        const seg = segs[segIndex]
+        if (!seg || !seg.length) return { best: -1, seg: -1, offset: -1, segLen: 0 }
+        const n = seg.length
+        var best = -1, bestOffset = expectedOffset
+        for (var d = -wbrbPhaseTolerance; d <= wbrbPhaseTolerance; d++) {
+            const start = (((expectedOffset + d) % n) + n) % n
+            var total = 0
+            for (var i = 0; i < recent.length; i++) total += wbrbCosine(seg[(start + i) % n], recent[i])
+            const score = total / recent.length
+            if (score > best) { best = score; bestOffset = start }
+        }
+        return { best: best, seg: segIndex, offset: bestOffset, segLen: n }
     }
 
     function wbrbSequenceMatch(learned, recent) {
@@ -1040,17 +1091,21 @@ v 1.2
     // --- policy (pure: no audio access, reused verbatim by the replay harness) ---
 
     // returns 'enter' | 'release' | null, mutating only the passed state object
-    function wbrbPolicyStep(st, score, levelDb, now, cfg) {
+    function wbrbPolicyStep(st, score, levelDb, now, cfg, ev) {
         st.score = score
         st.levelDb = levelDb
-        if (score >= cfg.entry) st.lastStrongAt = now
+        // Only phase-coherent evidence renews the watchdog. Raw high scores arrive constantly
+        // on ordinary audio (best-of-N), and letting those renew it meant a stuck mute could
+        // never time out.
+        const coherent = !ev || ev.coherent !== false
+        if (score >= cfg.entry && coherent) st.lastStrongAt = now
         if (!st.active) {
             // Baseline of what this feed normally scores. Falls fast and rises slowly, so it
             // tracks ordinary audio rather than being dragged up by a passing match.
             if (st.baseline < 0) st.baseline = score
             else st.baseline += (score < st.baseline ? 0.05 : 0.005) * (score - st.baseline)
             const beatsBaseline = score >= st.baseline + cfg.entryMargin
-            if (score >= cfg.entry && beatsBaseline) {
+            if (score >= cfg.entry && beatsBaseline && coherent) {
                 st.confirmations++
                 if (st.confirmations >= cfg.confirmations) {
                     st.active = true
@@ -1058,6 +1113,7 @@ v 1.2
                     st.valleySince = 0
                     st.matchedLevelDb = levelDb
                     st.lastStrongAt = now
+                    if (ev) { st.lockSeg = ev.seg; st.lockOffset = ev.offset }
                     return 'enter'
                 }
             } else {
@@ -1253,14 +1309,41 @@ v 1.2
         ;['left', 'right'].forEach(function(key) {
             const st = wbrbSide[key]
             if (st.recent.length < wbrbWindowFrames) return
-            const score = wbrbProfile ? wbrbMatchProfile(wbrbProfile, st.recent) : -1
+            var m = { best: -1, seg: -1, offset: -1, segLen: 0 }
+            if (wbrbProfile) {
+                m = st.active
+                    ? wbrbMatchLocked(wbrbProfile, st.recent, st.lockSeg, st.lockOffset + 1)
+                    : wbrbMatchProfile(wbrbProfile, st.recent)
+                if (m.best < 0 && st.active) m = wbrbMatchProfile(wbrbProfile, st.recent)
+            }
+            const score = m.best
+            // did the winning offset advance by about one frame, as a real loop would?
+            var coherent = true
+            if (wbrbRequirePhaseCoherence && !st.active) {
+                if (st.prevSeg === m.seg && st.prevOffset >= 0 && m.segLen > 0) {
+                    const expected = (st.prevOffset + 1) % m.segLen
+                    var diff = Math.abs(m.offset - expected)
+                    diff = Math.min(diff, m.segLen - diff)
+                    coherent = diff <= wbrbPhaseTolerance
+                } else {
+                    coherent = false
+                }
+                st.prevSeg = m.seg
+                st.prevOffset = m.offset
+            }
             if (!armed) {
                 st.score = score
                 // a disarmed detector must never hold a duck
-                if (st.active) { st.active = false; wbrbSetDuck(key, false) }
+                if (st.active) {
+                    st.active = false
+                    wbrbSetDuck(key, false)
+                    wbrbEvents.push({ t: now, side: key, event: 'release (disarmed)', score: Math.round(score * 1000) / 1000 })
+                }
                 return
             }
-            const verdict = wbrbPolicyStep(st, score, st.levelDb, now, cfg)
+            const verdict = wbrbPolicyStep(st, score, st.levelDb, now, cfg,
+                { coherent: coherent, seg: m.seg, offset: m.offset })
+            if (st.active) st.lockOffset = m.offset
             if (verdict) {
                 wbrbEvents.push({ t: now, side: key, event: verdict, score: Math.round(score * 1000) / 1000 })
                 while (wbrbEvents.length > 200) wbrbEvents.shift()
@@ -1302,20 +1385,34 @@ v 1.2
         while (wbrbCapture.length > cap) wbrbCapture.shift()
     }
 
+    // Saves a file rather than copying: a 10-minute capture is ~1MB, far too big to paste.
+    // The profile travels with it so the whole session can be replayed offline exactly.
     function wbrbDumpCapture() {
         const payload = {
             createdAt: Date.now(),
             frameMs: wbrbFrameMs,
             bandCount: wbrbBandCount,
-            profileFrames: wbrbProfile ? wbrbProfile.frames.length : 0,
+            feature: wbrbFeatureVersion,
+            thresholds: wbrbConfig(),
+            windowFrames: wbrbWindowFrames,
+            profile: wbrbProfile,
+            events: wbrbEvents,
             frames: wbrbCapture
         }
-        const json = JSON.stringify(payload)
         window.bblfLastCapture = payload
         try {
-            navigator.clipboard.writeText(json)
-            showSeekToast('capture copied (' + wbrbCapture.length + ' frames)')
+            const blob = new Blob([JSON.stringify(payload)], { type: 'application/json' })
+            const url = URL.createObjectURL(blob)
+            const a = document.createElement('a')
+            a.href = url
+            a.download = 'bblf-capture-' + new Date().toISOString().replace(/[:.]/g, '-') + '.json'
+            document.body.appendChild(a)
+            a.click()
+            document.body.removeChild(a)
+            setTimeout(function() { URL.revokeObjectURL(url) }, 5000)
+            showSeekToast('capture saved (' + wbrbCapture.length + ' frames)')
         } catch (e) {
+            warn('capture download failed: ' + e)
             showSeekToast('capture at window.bblfLastCapture')
         }
         log('capture: ' + wbrbCapture.length + ' frames, also at window.bblfLastCapture')
@@ -1338,6 +1435,8 @@ v 1.2
               Math.round(wbrbProfileFrameCount(wbrbProfile) * wbrbFrameMs / 1000) + 's), feature ' +
               (wbrbProfile.feature || '?') + ', segment lengths ' + segs.map(function(s) { return s.length }).join('/')
             : 'NONE'))
+        lines.push('phase coherence: ' + (wbrbRequirePhaseCoherence ? 'on (tol ' + wbrbPhaseTolerance + ')' : 'OFF') +
+            '   confirmations ' + wbrbEntryConfirmations)
         lines.push('settings: entry ' + wbrbEntryThreshold + ' continue ' + wbrbContinueThreshold +
             ' clearlyLive ' + wbrbClearlyLiveThreshold + ' window ' + wbrbWindowFrames +
             ' learn ' + getSetting('learnSeconds') + 's autoMute ' + getSetting('autoMute'))
@@ -1425,6 +1524,39 @@ v 1.2
         } catch (e) { return null }
     }
 
+    // Music repeats; conversation does not. A learn pass usually catches some live audio at the
+    // start (before the bed came up) or the end (after feeds returned), and those frames then
+    // match live audio perfectly - which is how voices got muted. Trim frames at each end that
+    // never recur elsewhere in the recording. Only the ends are trimmed, so the temporal order
+    // of what remains is untouched.
+    function wbrbTrimSegment(frames) {
+        const n = frames.length
+        if (n < 40) return frames
+        const gap = 20
+        const recurrence = new Array(n)
+        for (var i = 0; i < n; i++) {
+            var best = -1
+            for (var j = 0; j < n; j++) {
+                if (Math.abs(i - j) <= gap) continue
+                const c = wbrbCosine(frames[i], frames[j])
+                if (c > best) best = c
+            }
+            recurrence[i] = best
+        }
+        const sorted = recurrence.slice().sort(function(a, b) { return a - b })
+        const median = sorted[sorted.length >> 1]
+        const floor = Math.max(0.35, median - 0.20)
+        var start = 0, end = n - 1
+        while (start < n && recurrence[start] < floor) start++
+        while (end > start && recurrence[end] < floor) end--
+        const kept = frames.slice(start, end + 1)
+        if (kept.length < 20) return frames
+        if (start > 0 || end < n - 1) {
+            log('wbrb: trimmed ' + start + ' head and ' + (n - 1 - end) + ' tail frames that never recur (likely live audio, not the bed)')
+        }
+        return kept
+    }
+
     function wbrbStartLearn() {
         if (wbrbLearning) { wbrbStopLearn(false); return }
         wbrbLearning = true
@@ -1445,7 +1577,7 @@ v 1.2
             // append as a new segment: the bed is usually longer than one learn pass, so a few
             // passes across different breaks build coverage instead of replacing each other
             const segments = wbrbProfileSegments(wbrbProfile).slice()
-            segments.push(rounded)
+            segments.push(wbrbTrimSegment(rounded))
             var total = segments.reduce(function(n, s) { return n + s.length }, 0)
             while (total > wbrbMaxProfileFrames && segments.length > 1) {
                 total -= segments.shift().length

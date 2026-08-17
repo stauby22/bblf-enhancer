@@ -7,8 +7,9 @@
 // the mute for valleyMaxMs + graceMs (10.5s) instead of capping at valleyMaxMs (7s).
 
 const src = require('fs').readFileSync(process.argv[2], 'utf8');
-const consts = `var wbrbBandCount=32, wbrbEntryMarginOverBaseline=0.15, wbrbMaxHoldWithoutStrongMs=45000, wbrbClearlyLiveThreshold=0.35, wbrbAmbiguousHoldMs=20000, wbrbMinHz=80, wbrbMaxHz=8000, wbrbEntryThreshold=0.74,
- wbrbContinueThreshold=0.66, wbrbEntryConfirmations=3, wbrbReleaseGraceMs=3500,
+const consts = `var wbrbBandCount=32, wbrbEntryMarginOverBaseline=0.15, wbrbMaxHoldWithoutStrongMs=30000, wbrbClearlyLiveThreshold=0.35, wbrbAmbiguousHoldMs=20000, wbrbMinHz=80, wbrbMaxHz=8000, wbrbEntryThreshold=0.78,
+ wbrbContinueThreshold=0.66, wbrbEntryConfirmations=5, wbrbReleaseGraceMs=3500,
+ wbrbRequirePhaseCoherence=true, wbrbPhaseTolerance=2,
  wbrbFadeValleyDropDb=6, wbrbFadeValleyMaxMs=7000, levelTargetDb=-24, levelMaxBoostDb=12,
  levelMaxCutDb=6, levelGateDb=-52, levelWhisperFloorDb=-58, autoGainMaxDb=12;`;
 const grab = (n) => {
@@ -18,7 +19,7 @@ const grab = (n) => {
   return m[0];
 };
 eval(consts + [
-  'wbrbNormalize', 'wbrbDetrendNormalize', 'wbrbCosine', 'wbrbSequenceMatch', 'wbrbSpectrumToBands',
+  'wbrbNormalize', 'wbrbDetrendNormalize', 'wbrbMatchLocked', 'wbrbProfileSegments', 'wbrbCosine', 'wbrbSequenceMatch', 'wbrbSpectrumToBands',
   'wbrbNewSideState', 'wbrbPolicyStep', 'wbrbConfig', 'levelingGainDb', 'dbToGain', 'faderGains'
 ].map(grab).join('\n'));
 
@@ -65,9 +66,9 @@ const cfg = wbrbConfig();
 const prime = (state, from) => { let n = from; for (let i = 0; i < 30; i++) wbrbPolicyStep(state, 0.15, -25, n += 250, cfg); return n; };
 let st = wbrbNewSideState(), now = 0;
 now = prime(st, now);
-for (let i = 0; i < 2; i++) wbrbPolicyStep(st, 0.80, -20, now += 250, cfg);
-t('2 good frames do not mute yet', !st.active);
-t('3rd confirmation enters', wbrbPolicyStep(st, 0.80, -20, now += 250, cfg) === 'enter');
+for (let i = 0; i < 4; i++) wbrbPolicyStep(st, 0.80, -20, now += 250, cfg);
+t('4 good frames do not mute yet', !st.active);
+t('5th confirmation enters', wbrbPolicyStep(st, 0.80, -20, now += 250, cfg) === 'enter');
 st = wbrbNewSideState();
 let n2 = prime(st, 0);
 for (let i = 0; i < 10; i++) wbrbPolicyStep(st, 0.70, -20, n2 += 250, cfg);
@@ -75,7 +76,7 @@ t('sub-threshold never enters', !st.active);
 
 console.log('\n— policy: fade valley (the mid-break release bug) —');
 st = wbrbNewSideState(); now = 0; now = prime(st, now);
-for (let i = 0; i < 3; i++) wbrbPolicyStep(st, 0.85, -20, now += 250, cfg);
+for (let i = 0; i < 5; i++) wbrbPolicyStep(st, 0.85, -20, now += 250, cfg);
 let released = null;
 for (let i = 0; i < 16; i++) {
   const v = wbrbPolicyStep(st, 0.20, -30, now += 250, cfg);
@@ -94,7 +95,7 @@ t('valley cannot latch forever — hold caps near 7s', !st.active && heldMs <= 7
 
 console.log('\n— policy: normal release —');
 st = wbrbNewSideState(); now = 0; now = prime(st, now);
-for (let i = 0; i < 3; i++) wbrbPolicyStep(st, 0.85, -20, now += 250, cfg);
+for (let i = 0; i < 5; i++) wbrbPolicyStep(st, 0.85, -20, now += 250, cfg);
 const enterAt = now;
 let relAt = null;
 for (let i = 0; i < 30; i++) {
@@ -123,7 +124,7 @@ t('a pure tilt difference alone is neutralised',
 
 console.log('\n— policy: a duck can never latch permanently —');
 st = wbrbNewSideState(); now = 0; now = prime(st, now);
-for (let i = 0; i < 3; i++) wbrbPolicyStep(st, 0.85, -20, now += 250, cfg);
+for (let i = 0; i < 5; i++) wbrbPolicyStep(st, 0.85, -20, now += 250, cfg);
 t('ducked', st.active);
 let watchdogRel = null;
 const heldFrom = now;
@@ -133,7 +134,7 @@ for (let i = 0; i < 400 && watchdogRel === null; i++) {
   const v = wbrbPolicyStep(st, 0.70, -20, now += 250, cfg);
   if (v === 'release') watchdogRel = now - heldFrom;
 }
-t('watchdog releases without full-confidence evidence', watchdogRel !== null && watchdogRel <= 46000,
+t('watchdog releases without full-confidence evidence', watchdogRel !== null && watchdogRel <= 31000,
   '(released after ' + (watchdogRel / 1000).toFixed(1) + 's)');
 
 console.log('\n— policy: baseline gate —');
@@ -146,19 +147,19 @@ t('sustained high scores alone do not mute once they are the norm', !st.active,
 console.log('\n— policy: long break bed (the flicker) —');
 // An unlearned passage of the same bed scores in the ambiguous band. It must not unmute.
 st = wbrbNewSideState(); now = 0; now = prime(st, now);
-for (let i = 0; i < 3; i++) wbrbPolicyStep(st, 0.85, -20, now += 250, cfg);
+for (let i = 0; i < 5; i++) wbrbPolicyStep(st, 0.85, -20, now += 250, cfg);
 let flicker = null;
 for (let i = 0; i < 40; i++) {           // 10s of ambiguous (0.50), level steady
   const v = wbrbPolicyStep(st, 0.50, -20, now += 250, cfg);
   if (v === 'release' && flicker === null) flicker = i;
 }
 t('ambiguous passage does not unmute mid-break', st.active && flicker === null);
-for (let i = 0; i < 3; i++) wbrbPolicyStep(st, 0.85, -20, now += 250, cfg);  // learned part returns
+for (let i = 0; i < 5; i++) wbrbPolicyStep(st, 0.85, -20, now += 250, cfg);  // learned part returns
 t('still ducked when the learned passage comes back around', st.active);
 
 console.log('\n— policy: feeds actually returning still releases promptly —');
 st = wbrbNewSideState(); now = 0; now = prime(st, now);
-for (let i = 0; i < 3; i++) wbrbPolicyStep(st, 0.85, -20, now += 250, cfg);
+for (let i = 0; i < 5; i++) wbrbPolicyStep(st, 0.85, -20, now += 250, cfg);
 const liveFrom = now;
 let liveRel = null;
 for (let i = 0; i < 40; i++) {           // house audio: clearly below clearlyLive
@@ -170,15 +171,58 @@ t('clearly-live audio releases on the normal grace', liveRel !== null && liveRel
 
 console.log('\n— policy: ambiguity cannot hold forever —');
 st = wbrbNewSideState(); now = 0; now = prime(st, now);
-for (let i = 0; i < 3; i++) wbrbPolicyStep(st, 0.85, -20, now += 250, cfg);
+for (let i = 0; i < 5; i++) wbrbPolicyStep(st, 0.85, -20, now += 250, cfg);
 const ambFrom = now;
 let ambRel = null;
 for (let i = 0; i < 400 && ambRel === null; i++) {
   const v = wbrbPolicyStep(st, 0.50, -20, now += 250, cfg);
   if (v === 'release') ambRel = now - ambFrom;
 }
-t('sustained ambiguity releases within the watchdog window', ambRel !== null && ambRel <= 46000,
+t('sustained ambiguity releases within the watchdog window', ambRel !== null && ambRel <= 31000,
   '(released after ' + (ambRel / 1000).toFixed(1) + 's)');
+
+console.log('\n— phase coherence (rejecting best-of-N coincidences) —');
+// A real loop advances one frame per tick. A chance match lands on an unrelated offset each
+// time. Incoherent evidence must never mute, however high it scores.
+st = wbrbNewSideState(); now = 0; now = prime(st, now);
+let incoherentEntered = false;
+for (let i = 0; i < 40; i++) {
+  if (wbrbPolicyStep(st, 0.95, -20, now += 250, cfg, { coherent: false, seg: 0, offset: (i * 37) % 300 }) === 'enter') incoherentEntered = true;
+}
+t('high but incoherent scores never mute', !incoherentEntered && !st.active);
+st = wbrbNewSideState(); now = 0; now = prime(st, now);
+let coherentEntered = false;
+for (let i = 0; i < 8; i++) {
+  if (wbrbPolicyStep(st, 0.85, -20, now += 250, cfg, { coherent: true, seg: 0, offset: 100 + i }) === 'enter') coherentEntered = true;
+}
+t('coherent advancing match still mutes', coherentEntered && st.active);
+t('entry records the lock position', st.lockSeg === 0 && st.lockOffset >= 100);
+st = wbrbNewSideState(); now = 0; now = prime(st, now);
+for (let i = 0; i < 5; i++) wbrbPolicyStep(st, 0.95, -20, now += 250, cfg, { coherent: true, seg: 0, offset: i });
+let incoherentHeld = null;
+for (let i = 0; i < 200 && incoherentHeld === null; i++) {
+  // stuck: scores stay high but never phase-coherent again - the watchdog must fire
+  const v = wbrbPolicyStep(st, 0.95, -20, now += 250, cfg, { coherent: false, seg: 0, offset: (i * 53) % 300 });
+  if (v === 'release') incoherentHeld = i * 250;
+}
+t('incoherent high scores cannot renew the watchdog', incoherentHeld !== null && incoherentHeld <= 31000,
+  '(released after ' + (incoherentHeld / 1000).toFixed(1) + 's)');
+
+console.log('\n— locked matching —');
+let segSeed = 12345;
+const segRnd = () => { segSeed = (segSeed * 1103515245 + 12345) % 2147483648; return segSeed / 2147483648; };
+const seg = Array.from({ length: 50 }, () =>
+  wbrbDetrendNormalize(Array.from({ length: 32 }, (_, b) => -0.9 * b + 10 * segRnd())));
+const prof = { segments: [seg], feature: 'detrend-v2' };
+const win = seg.slice(20, 32);
+const locked = wbrbMatchLocked(prof, win, 0, 20);
+t('locked search finds the exact continuation', locked.best > 0.99 && locked.offset === 20,
+  '(score ' + locked.best.toFixed(3) + ' at offset ' + locked.offset + ')');
+const lockedWrong = wbrbMatchLocked(prof, win, 0, 40);
+t('locked search does NOT find a far-away offset', lockedWrong.best < 0.6,
+  '(score ' + lockedWrong.best.toFixed(3) + ' vs ' + locked.best.toFixed(3) + ' at the right place)');
+t('segments helper handles the legacy single-frames shape',
+  wbrbProfileSegments({ frames: seg }).length === 1 && wbrbProfileSegments(prof).length === 1);
 
 console.log('\n— leveling gate —');
 t('true silence gets no boost', levelingGainDb(-70) === 0);
