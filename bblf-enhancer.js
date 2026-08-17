@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BBLF Enhancer
 // @namespace    http://tampermonkey.net/
-// @version      1.18.2
+// @version      1.19
 // @description  Monitor for issues on Big Brother Live Feed streams, reloading or starting video when necessary. Can autoload quad cam, add hotkeys, show video scrubber, and remap fullscreen button to only show video.
 // @author       liquid8d
 // @match        https://www.paramountplus.com/live-tv/stream/big_brother/*
@@ -14,6 +14,21 @@
 
 // ==/UserScript==
 /*
+v 1.19 (2026)
+ - FIX for quiet whispering being muted. Whispering is as steady (sd 2.6-3.5) and as loud
+   (-37 dB) as the break bed, so no level threshold can separate them - confirmed by testing
+   tonality, spectral peakiness, peak persistence and 30s windows, all of which came back with
+   near-identical distributions for the two.
+   What does separate them is whether the two channels move TOGETHER:
+     break bed    envelope correlation -0.12 (both captures at or below 0.43)
+     whispering   envelope correlation  0.95 (never below 0.79)
+   A bed is a stereo mix whose channels are independent; a quiet room is one sound on both
+   cams. Note this is the LEVEL envelope, not the spectral agreement tried in v1.18 - that one
+   was inconsistent between breaks and stays telemetry.
+ - high envelope correlation is also positive evidence of live audio, so a mute releases fast
+   when the room comes back
+ - entry lengthened to 16 frames (4s): the longest run of live audio clearing every test
+   across four real captures is 10 frames
 v 1.18.2 (2026)
  - a third capture caught steady continuous speech on one channel being muted: it sat at
    level sd 5.4-6.8 against the bed's 2.7. Entry tightened to sd<=4.5 / pause<=0.10, which is
@@ -350,6 +365,10 @@ v 1.2
     //   * level is rock steady   (music sd ~2.7 dB, live conversation ~12 dB)
     //   * no pauses              (music ~0%, conversation ~30% of frames sit in a gap)
     //   * it is LOUD             (the bed runs ~-32 dB; a silent house sits ~-69 dB)
+    //   * the two channels move INDEPENDENTLY (a stereo bed decorrelates them: envelope
+    //     correlation ~-0.12; one room mic feeding both cams correlates them: whispering
+    //     measured 0.95). This is what finally separated quiet steady whispering from a bed -
+    //     whispering is as even and as loud as music, so level statistics alone cannot do it.
     // The loudness floor is what makes the other two safe. A quiet room is also perfectly
     // steady and pause-free - it produced every false mute in testing (8s runs of live audio
     // passing the first two tests) and vanishes entirely once loudness is required.
@@ -397,13 +416,26 @@ v 1.2
     // the bed must be audible. Raising this misses quiet beds; lowering it lets a silent
     // house look like music again
     const musicMinLevelDb = -45
+    // How alike the two channels' LEVEL ENVELOPES are - not their spectra, which proved
+    // inconsistent between breaks. Measured: both break beds sit at or below 0.43, whispering
+    // at 0.79-0.99, ordinary conversation in between. A bed is a stereo mix whose channels
+    // rise and fall independently; a quiet room is the same sound on both cams.
+    // 0.5 sits above both beds' p90 (0.26 and 0.44) and far below whispering's p10 (0.81).
+    const musicMaxEnvCorrelation = 0.5
+    // envelope correlation this high is positive evidence of one room on both cams, i.e. live
+    const liveMinEnvCorrelation = 0.75
+    // A correlation over 20 samples is jittery: during one break it swung between -0.37 and
+    // 0.52 frame to frame, crossing the threshold often enough to keep resetting the entry
+    // counter and delaying the mute by 10s. Smooth it before comparing.
+    const envCorrSmoothing = 0.15
     // while a mute is held, tolerate quieter passages of the bed before giving up on it
     const musicSustainMinLevelDb = -55
     // Hysteresis: a mute already held tolerates a livelier bed than it took to acquire one.
     // Without this a channel whose level wanders (sd ~10) starts the release timer mid-break.
     const musicSustainSdMultiplier = 1.8
-    // consecutive qualifying frames before ducking (8 * 250ms = 2s of evidence)
-    const musicEnterFrames = 8
+    // consecutive qualifying frames before ducking. The longest run of live audio that clears
+    // every test across four real captures is 10 frames, so 16 leaves real margin
+    const musicEnterFrames = 16
     // FeedBot is an independent second opinion: it screenshots the feeds and classifies them,
     // which is the pixel evidence a userscript cannot gather itself (Widevine reads back black).
     // It lags by up to a poll interval, so it never blocks a mute - it just asks for more
@@ -991,6 +1023,8 @@ v 1.2
     let wbrbEvents = []
     let wbrbLrWindow = []
     let wbrbLr = 0
+    let wbrbEnvCorr = 0
+    let wbrbEnvCorrSeeded = false
     let wbrbLastTickAt = 0
     let feedStatus = null
     let feedStatusSince = 0
@@ -1182,7 +1216,23 @@ v 1.2
 
     // --- policy (pure: no audio access, reused verbatim by the replay harness) ---
 
-    // Rolling statistics for one side. Pure: takes levels and the shared stereo agreement.
+    // Correlation between the two channels' level envelopes. Pure.
+    function wbrbEnvelopeCorrelation(a, b) {
+        const n = Math.min(a.length, b.length)
+        if (n < 8) return 0
+        var ma = 0, mb = 0
+        for (var i = 0; i < n; i++) { ma += a[a.length - n + i]; mb += b[b.length - n + i] }
+        ma /= n; mb /= n
+        var num = 0, da = 0, db = 0
+        for (var j = 0; j < n; j++) {
+            const x = a[a.length - n + j] - ma, y = b[b.length - n + j] - mb
+            num += x * y; da += x * x; db += y * y
+        }
+        const den = Math.sqrt(da * db)
+        return den > 1e-9 ? num / den : 0
+    }
+
+    // Rolling statistics for one side. Pure: takes levels and the shared envelope correlation.
     function wbrbEvidence(levels, stereoAgreement, cfg) {
         const n = levels.length
         if (n < cfg.analysisFrames) return { valid: false, music: false, live: false, sd: 0, pause: 0 }
@@ -1197,12 +1247,14 @@ v 1.2
         }
         const sd = Math.sqrt(varSum / n)
         const pause = quiet / n
-        const music = sd <= cfg.musicMaxSd && pause <= cfg.musicMaxPause && mean >= cfg.musicMinLevel
+        const music = sd <= cfg.musicMaxSd && pause <= cfg.musicMaxPause &&
+            mean >= cfg.musicMinLevel && stereoAgreement <= cfg.musicMaxEnvCorr
         // looser test used only to SUSTAIN an existing mute
         const musicSustain = sd <= cfg.musicMaxSd * cfg.sustainSdMult &&
-            pause <= cfg.musicMaxPause * 1.5 && mean >= cfg.sustainMinLevel
+            pause <= cfg.musicMaxPause * 1.5 && mean >= cfg.sustainMinLevel &&
+            stereoAgreement < cfg.liveMinEnvCorr
         // positive evidence of people, not merely the absence of a bed
-        const live = pause >= cfg.liveMinPause
+        const live = pause >= cfg.liveMinPause || stereoAgreement >= cfg.liveMinEnvCorr
         return { valid: true, music: music, musicSustain: musicSustain, live: live,
             sd: sd, pause: pause, level: mean }
     }
@@ -1267,6 +1319,8 @@ v 1.2
             musicMaxSd: musicMaxLevelSd,
             musicMaxPause: musicMaxPauseRatio,
             musicMinLevel: musicMinLevelDb,
+            musicMaxEnvCorr: musicMaxEnvCorrelation,
+            liveMinEnvCorr: liveMinEnvCorrelation,
             sustainMinLevel: musicSustainMinLevelDb,
             enterFrames: musicEnterFrames,
             sustainSdMult: musicSustainSdMultiplier,
@@ -1395,7 +1449,7 @@ v 1.2
         const cfg = wbrbConfig()
         const armed = getSetting('autoMute')
 
-        // shared stereo agreement: how alike the two channels are right now
+        // spectral agreement is telemetry only - it proved inconsistent between breaks
         const lrNow = wbrbCosine(bandsByKey.left, bandsByKey.right)
         wbrbLrWindow.push(lrNow)
         while (wbrbLrWindow.length > wbrbAnalysisFrames) wbrbLrWindow.shift()
@@ -1406,11 +1460,19 @@ v 1.2
         const gap = wbrbLastTickAt && (now - wbrbLastTickAt) > (wbrbFrameMs * 3)
         wbrbLastTickAt = now
 
+        // do the channels rise and fall together? computed once, shared by both sides, and
+        // smoothed because the raw figure is too jittery to threshold directly
+        const envCorrRaw = wbrbEnvelopeCorrelation(wbrbSide.left.levels, wbrbSide.right.levels)
+        wbrbEnvCorr = (wbrbEnvCorrSeeded)
+            ? wbrbEnvCorr * (1 - envCorrSmoothing) + envCorrRaw * envCorrSmoothing
+            : envCorrRaw
+        wbrbEnvCorrSeeded = true
+
         ;['left', 'right'].forEach(function(key) {
             const st = wbrbSide[key]
             const silent = st.levelDb < -100
             if (gap || silent) {
-                if (gap) { st.levels = []; wbrbLrWindow = [] }
+                if (gap) { st.levels = []; wbrbLrWindow = []; wbrbEnvCorrSeeded = false }
                 // hold whatever state we are in; silence is neither music nor people
                 return
             }
@@ -1423,7 +1485,7 @@ v 1.2
                 st.score = wbrbMatchProfile(wbrbProfile, st.recent).best
             }
 
-            const ev = wbrbEvidence(st.levels, wbrbLr, cfg)
+            const ev = wbrbEvidence(st.levels, wbrbEnvCorr, cfg)
             // second opinion: while FeedBot still says the feeds are up, ask for more evidence
             cfg.enterFrames = feedsConfirmedUp() ? musicEnterFramesWhenFeedsUp : musicEnterFrames
             if (!armed) {
@@ -1476,6 +1538,7 @@ v 1.2
             dbR: Math.round(wbrbSide.right.levelDb * 10) / 10,
             sL: r3(wbrbSide.left.score),
             sR: r3(wbrbSide.right.score),
+            envCorr: r3(wbrbEnvCorr),
             sdL: Math.round(wbrbSide.left.sd * 10) / 10,
             sdR: Math.round(wbrbSide.right.sd * 10) / 10,
             lr: r3(wbrbLr),
@@ -1537,12 +1600,13 @@ v 1.2
             : 'NONE'))
         lines.push('detector: statistical (no profile needed)  autoMute ' + getSetting('autoMute'))
         lines.push('entry: sd<=' + musicMaxLevelSd + ' pause<=' + musicMaxPauseRatio +
-            ' level>=' + musicMinLevelDb + 'dB for ' + musicEnterFrames + ' frames')
+            ' level>=' + musicMinLevelDb + 'dB envCorr<=' + musicMaxEnvCorrelation +
+            ' for ' + musicEnterFrames + ' frames')
         lines.push('feedbot: ' + (feedStatus || 'unknown') +
             (feedsConfirmedUp() ? ' (corroborating live — entry needs ' + musicEnterFramesWhenFeedsUp + ' frames)' : ''))
         lines.push('release: people ' + (liveReleaseMs / 1000) + 's / quiet ' + (quietReleaseMs / 1000) +
             's / backstop ' + (wbrbMaxHoldWithoutStrongMs / 1000) + 's')
-        lines.push('now: stereo ' + wbrbLr.toFixed(2) + '  L sd ' + wbrbSide.left.sd.toFixed(1) +
+        lines.push('now: envCorr ' + wbrbEnvCorr.toFixed(2) + ' (stereo ' + wbrbLr.toFixed(2) + ')  L sd ' + wbrbSide.left.sd.toFixed(1) +
             ' pause ' + wbrbSide.left.pause.toFixed(2) + '  R sd ' + wbrbSide.right.sd.toFixed(1) +
             ' pause ' + wbrbSide.right.pause.toFixed(2))
         lines.push('capture: ' + wbrbCapture.length + ' frames (' +
@@ -1760,7 +1824,8 @@ v 1.2
                 L.levelDb.toFixed(0).padStart(5) + 'dB ' + mark(L) + '\n' +
             'R sd' + R.sd.toFixed(1).padStart(5) + ' pause' + R.pause.toFixed(2).padStart(5) +
                 R.levelDb.toFixed(0).padStart(5) + 'dB ' + mark(R) + '\n' +
-            'stereo ' + wbrbLr.toFixed(2) + '  (telemetry)' +
+            'envCorr ' + wbrbEnvCorr.toFixed(2) +
+                (wbrbEnvCorr <= musicMaxEnvCorrelation ? ' indep(bed)' : (wbrbEnvCorr >= liveMinEnvCorrelation ? ' same(room)' : '')) +
             (wbrbProfile ? '  tmpl ' + Math.max(0, L.score).toFixed(2) : '')
     }
 

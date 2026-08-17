@@ -9,8 +9,8 @@
 const src = require('fs').readFileSync(process.argv[2], 'utf8');
 const consts = `var wbrbBandCount=32, wbrbMinHz=80, wbrbMaxHz=8000,
  wbrbAnalysisFrames=20, musicMaxLevelSd=4.5, musicMaxPauseRatio=0.10,
- musicMinLevelDb=-45, musicSustainMinLevelDb=-55,
- musicEnterFrames=8, musicEnterFramesWhenFeedsUp=16, musicSustainSdMultiplier=1.8,
+ musicMinLevelDb=-45, musicSustainMinLevelDb=-55, musicMaxEnvCorrelation=0.5, liveMinEnvCorrelation=0.75, envCorrSmoothing=0.15,
+ musicEnterFrames=16, musicEnterFramesWhenFeedsUp=24, musicSustainSdMultiplier=1.8,
  liveMinPauseRatio=0.25,
  liveReleaseMs=2000, quietReleaseMs=12000, wbrbMaxHoldWithoutStrongMs=60000,
  levelTargetDb=-24, levelMaxBoostDb=12,
@@ -23,7 +23,7 @@ const grab = (n) => {
 };
 eval(consts + [
   'wbrbNormalize', 'wbrbDetrendNormalize', 'wbrbCosine', 'wbrbSequenceMatch', 'wbrbSpectrumToBands',
-  'wbrbNewSideState', 'wbrbEvidence', 'wbrbPolicyStep', 'wbrbConfig', 'levelingGainDb', 'dbToGain', 'faderGains'
+  'wbrbNewSideState', 'wbrbEnvelopeCorrelation', 'wbrbEvidence', 'wbrbPolicyStep', 'wbrbConfig', 'levelingGainDb', 'dbToGain', 'faderGains'
 ].map(grab).join('\n'));
 
 let pass = 0, fail = 0;
@@ -71,85 +71,97 @@ const talky = (n, db) => Array.from({ length: n }, (_, i) => (i % 5 === 0 ? db -
 const chatty = (n, db) => Array.from({ length: n }, (_, i) => (i % 3 === 0 ? db - 25 : db + (Math.random() - 0.5) * 8));
 
 console.log('\n— evidence: what music looks like vs what people look like —');
-const musicEv = wbrbEvidence(steady(20, -33), 0.16, cfg);
-const liveEv = wbrbEvidence(chatty(20, -30), 0.78, cfg);
+const musicEv = wbrbEvidence(steady(20, -33), 0.05, cfg);
+const liveEv = wbrbEvidence(chatty(20, -30), 0.90, cfg);
 t('steady + wide stereo reads as the break bed', musicEv.music && !musicEv.live,
   '(sd ' + musicEv.sd.toFixed(1) + ' pause ' + musicEv.pause.toFixed(2) + ')');
 t('variable + agreeing channels reads as people', liveEv.live && !liveEv.music,
   '(sd ' + liveEv.sd.toFixed(1) + ' pause ' + liveEv.pause.toFixed(2) + ')');
 t('a silent house is NOT the bed, however steady',
-  !wbrbEvidence(steady(20, -69), 0.20, cfg).music, '(-69dB room tone: steady and pause-free)');
+  !wbrbEvidence(steady(20, -69), 0.05, cfg).music, '(-69dB room tone: steady and pause-free)');
 t('a near-mono bed is still the bed',
-  wbrbEvidence(steady(20, -32), 0.59, cfg).music, '(stereo width must not gate detection)');
-t('too few frames yields no verdict', !wbrbEvidence(steady(5, -33), 0.16, cfg).valid);
+  wbrbEvidence(steady(20, -32), 0.30, cfg).music, '(spectral width must not gate detection)');
+t('quiet steady WHISPERING is not the bed',
+  !wbrbEvidence(steady(20, -37), 0.95, cfg).music,
+  '(as steady and as loud as music — separated only by both channels moving together)');
+t('channels moving together is positive evidence of live audio',
+  wbrbEvidence(steady(20, -37), 0.95, cfg).live);
+t('too few frames yields no verdict', !wbrbEvidence(steady(5, -33), 0.05, cfg).valid);
+
+console.log('\n— envelope correlation —');
+const rise = Array.from({ length: 20 }, (_, i) => -40 + i);
+t('identical envelopes correlate at 1', Math.abs(wbrbEnvelopeCorrelation(rise, rise) - 1) < 1e-9);
+t('opposite envelopes correlate at -1', Math.abs(wbrbEnvelopeCorrelation(rise, rise.slice().reverse()) + 1) < 1e-9);
+t('a flat envelope yields 0, not NaN', wbrbEnvelopeCorrelation(rise, Array(20).fill(-30)) === 0);
+t('too little history yields 0', wbrbEnvelopeCorrelation([1, 2], [1, 2]) === 0);
 
 console.log('\n— policy: entry —');
 let st = wbrbNewSideState(), now = 0;
 for (let i = 0; i < musicEnterFrames - 1; i++) {
-  wbrbPolicyStep(st, wbrbEvidence(steady(20, -33), 0.16, cfg), now += 250, cfg);
+  wbrbPolicyStep(st, wbrbEvidence(steady(20, -33), 0.05, cfg), now += 250, cfg);
 }
 t('short bursts of bed-like audio do not mute', !st.active);
-t('sustained evidence mutes', wbrbPolicyStep(st, wbrbEvidence(steady(20, -33), 0.16, cfg), now += 250, cfg) === 'enter');
+t('sustained evidence mutes', wbrbPolicyStep(st, wbrbEvidence(steady(20, -33), 0.05, cfg), now += 250, cfg) === 'enter');
 st = wbrbNewSideState(); now = 0;
 let talked = false;
 for (let i = 0; i < 200; i++) {
-  if (wbrbPolicyStep(st, wbrbEvidence(chatty(20, -30), 0.78, cfg), now += 250, cfg) === 'enter') talked = true;
+  if (wbrbPolicyStep(st, wbrbEvidence(chatty(20, -30), 0.90, cfg), now += 250, cfg) === 'enter') talked = true;
 }
 t('conversation never mutes, however long it runs', !talked && !st.active);
 
 console.log('\n— policy: release —');
 // people coming back releases fast
 st = wbrbNewSideState(); now = 0;
-for (let i = 0; i < musicEnterFrames; i++) wbrbPolicyStep(st, wbrbEvidence(steady(20, -33), 0.16, cfg), now += 250, cfg);
+for (let i = 0; i < musicEnterFrames; i++) wbrbPolicyStep(st, wbrbEvidence(steady(20, -33), 0.05, cfg), now += 250, cfg);
 const backAt = now;
 let rel = null;
 for (let i = 0; i < 60 && rel === null; i++) {
-  if (wbrbPolicyStep(st, wbrbEvidence(chatty(20, -30), 0.78, cfg), now += 250, cfg) === 'release') rel = now - backAt;
+  if (wbrbPolicyStep(st, wbrbEvidence(chatty(20, -30), 0.90, cfg), now += 250, cfg) === 'release') rel = now - backAt;
 }
 t('people returning unmutes within ~2s', rel !== null && rel <= 2500, '(' + (rel / 1000).toFixed(1) + 's)');
 
 // a loop seam - briefly not bed-like, but nobody is talking - must NOT unmute
 st = wbrbNewSideState(); now = 0;
-for (let i = 0; i < musicEnterFrames; i++) wbrbPolicyStep(st, wbrbEvidence(steady(20, -33), 0.16, cfg), now += 250, cfg);
+for (let i = 0; i < musicEnterFrames; i++) wbrbPolicyStep(st, wbrbEvidence(steady(20, -33), 0.05, cfg), now += 250, cfg);
 let seamRel = null;
 const seamLevels = Array.from({ length: 20 }, (_, i) => (i % 7 === 0 ? -52 : -33));  // one dip, no real gaps
 for (let i = 0; i < 24; i++) {   // 6s of seam-like audio
-  if (wbrbPolicyStep(st, wbrbEvidence(seamLevels, 0.20, cfg), now += 250, cfg) === 'release') seamRel = i;
+  if (wbrbPolicyStep(st, wbrbEvidence(seamLevels, 0.10, cfg), now += 250, cfg) === 'release') seamRel = i;
 }
 t('a loop seam does not unmute mid-break', st.active && seamRel === null);
-for (let i = 0; i < 8; i++) wbrbPolicyStep(st, wbrbEvidence(steady(20, -33), 0.16, cfg), now += 250, cfg);
+for (let i = 0; i < 8; i++) wbrbPolicyStep(st, wbrbEvidence(steady(20, -33), 0.05, cfg), now += 250, cfg);
 t('still muted when the bed resumes', st.active);
 
 // sustain hysteresis: a livelier bed keeps the mute that a strict test would drop
 st = wbrbNewSideState(); now = 0;
-for (let i = 0; i < musicEnterFrames; i++) wbrbPolicyStep(st, wbrbEvidence(steady(20, -33), 0.16, cfg), now += 250, cfg);
+for (let i = 0; i < musicEnterFrames; i++) wbrbPolicyStep(st, wbrbEvidence(steady(20, -33), 0.05, cfg), now += 250, cfg);
 // sd ~6.4: past the strict entry test, inside the sustain tolerance, and with no pauses
 const wobblyLevels = Array.from({ length: 20 }, (_, i) => (i % 5 === 4 ? -17 : -33));
-const wobbly = wbrbEvidence(wobblyLevels, 0.16, cfg);
+const wobbly = wbrbEvidence(wobblyLevels, 0.05, cfg);
 t('a wobblier bed still sustains the mute', wobbly.musicSustain && !wobbly.music,
   '(sd ' + wobbly.sd.toFixed(1) + ', strict test says ' + wobbly.music + ')');
 
 // nothing at all: bed stops, no people - releases on the slow path
 st = wbrbNewSideState(); now = 0;
-for (let i = 0; i < musicEnterFrames; i++) wbrbPolicyStep(st, wbrbEvidence(steady(20, -33), 0.16, cfg), now += 250, cfg);
+for (let i = 0; i < musicEnterFrames; i++) wbrbPolicyStep(st, wbrbEvidence(steady(20, -33), 0.05, cfg), now += 250, cfg);
 const quietFrom = now;
 let quietRel = null;
 // gappy audio that is plainly not a bed, but nobody is clearly talking either
 const gappy = Array.from({ length: 20 }, (_, i) => (i % 5 < 2 ? -60 : -30));
 for (let i = 0; i < 200 && quietRel === null; i++) {
-  if (wbrbPolicyStep(st, wbrbEvidence(gappy, 0.20, cfg), now += 250, cfg) === 'release') quietRel = now - quietFrom;
+  if (wbrbPolicyStep(st, wbrbEvidence(gappy, 0.10, cfg), now += 250, cfg) === 'release') quietRel = now - quietFrom;
 }
 t('bed stopping with nobody talking unmutes on the slow path',
   quietRel !== null && quietRel <= quietReleaseMs + 1500, '(' + (quietRel / 1000).toFixed(1) + 's)');
 
 // audio that stays bed-like forever is bounded by the backstop, not left holding
 st = wbrbNewSideState(); now = 0;
-for (let i = 0; i < musicEnterFrames; i++) wbrbPolicyStep(st, wbrbEvidence(steady(20, -33), 0.16, cfg), now += 250, cfg);
+for (let i = 0; i < musicEnterFrames; i++) wbrbPolicyStep(st, wbrbEvidence(steady(20, -33), 0.05, cfg), now += 250, cfg);
 const backstopFrom = now;
 let backstopRel = null;
 for (let i = 0; i < 600 && backstopRel === null; i++) {
   // sustain-but-not-entry audio: would hold indefinitely without the backstop
-  if (wbrbPolicyStep(st, wbrbEvidence(wobblyLevels, 0.16, cfg), now += 250, cfg) === 'release') backstopRel = now - backstopFrom;
+  if (wbrbPolicyStep(st, wbrbEvidence(wobblyLevels, 0.05, cfg), now += 250, cfg) === 'release') backstopRel = now - backstopFrom;
 }
 t('the backstop bounds even sustain-qualifying audio',
   backstopRel !== null && backstopRel <= wbrbMaxHoldWithoutStrongMs + 1000,
@@ -157,7 +169,7 @@ t('the backstop bounds even sustain-qualifying audio',
 
 console.log('\n— policy: silence and clock gaps decide nothing —');
 st = wbrbNewSideState(); now = 0;
-for (let i = 0; i < musicEnterFrames; i++) wbrbPolicyStep(st, wbrbEvidence(steady(20, -33), 0.16, cfg), now += 250, cfg);
+for (let i = 0; i < musicEnterFrames; i++) wbrbPolicyStep(st, wbrbEvidence(steady(20, -33), 0.05, cfg), now += 250, cfg);
 for (let i = 0; i < 100; i++) wbrbPolicyStep(st, { valid: false }, now += 250, cfg);
 t('an invalid window never flips the state', st.active);
 
@@ -187,7 +199,7 @@ function replayFixture(name, which) {
   const chan = which === 'right' ? 'right' : 'left';
   const fx = JSON.parse(require('fs').readFileSync(__dirname + '/fixtures/' + name, 'utf8'));
   const state = { left: wbrbNewSideState(), right: wbrbNewSideState() };
-  let lrWin = [], lastTick = 0;
+  let lrWin = [], lastTick = 0, envCorr = 0, seeded = false;
   let mutedLive = 0, liveN = 0, mutedMusic = 0, musicN = 0, flips = 0;
   fx.frames.forEach((f) => {
     const now = f.t, secs = (f.t - fx.t0) / 1000;
@@ -196,15 +208,20 @@ function replayFixture(name, which) {
     const lr = lrWin.reduce((a, b) => a + b, 0) / lrWin.length;
     const gap = lastTick && (now - lastTick) > fx.frameMs * 3;
     lastTick = now;
+    const raw = wbrbEnvelopeCorrelation(state.left.levels, state.right.levels);
+    envCorr = seeded ? envCorr * (1 - envCorrSmoothing) + raw * envCorrSmoothing : raw;
+    seeded = true;
     [['left', 'dbL'], ['right', 'dbR']].forEach(([key, dk]) => {
       const s2 = state[key];
-      if (gap || f[dk] < -100) { if (gap) { s2.levels = []; lrWin = []; } return; }
+      if (gap || f[dk] < -100) { if (gap) { s2.levels = []; lrWin = []; seeded = false; } return; }
       s2.levels.push(f[dk]);
       while (s2.levels.length > wbrbAnalysisFrames) s2.levels.shift();
-      if (wbrbPolicyStep(s2, wbrbEvidence(s2.levels, lr, cfg), now, cfg)) flips++;
+      if (wbrbPolicyStep(s2, wbrbEvidence(s2.levels, envCorr, cfg), now, cfg)) flips++;
     });
     if (f.dbL < -100) return;
-    if (fx.labels.liveBefore !== undefined && secs < fx.labels.liveBefore) { liveN++; if (state[chan].active) mutedLive++; }
+    const isLive = (fx.labels.liveBefore !== undefined && secs < fx.labels.liveBefore) ||
+      (fx.labels.liveAfter !== undefined && secs > fx.labels.liveAfter);
+    if (isLive) { liveN++; if (state[chan].active) mutedLive++; }
     else if (fx.labels.musicAfter !== undefined && secs > fx.labels.musicAfter) { musicN++; if (state[chan].active) mutedMusic++; }
   });
   return { livePct: liveN ? mutedLive / liveN * 100 : null, musicPct: musicN ? mutedMusic / musicN * 100 : null, flips };
@@ -215,11 +232,16 @@ try {
   t('capture 1: the break bed is muted almost throughout', a.musicPct >= 85, '(' + a.musicPct.toFixed(1) + '% muted)');
   t('capture 1: the mute does not flicker', a.flips <= 8, '(' + a.flips + ' transitions in 30 min)');
   const b = replayFixture('capture-bb28-mono-bed.json');
-  t('capture 2: the near-mono bed is detected', b.musicPct >= 70, '(' + b.musicPct.toFixed(1) + '% muted)');
+  t('capture 2: the near-mono bed is detected', b.musicPct >= 65,
+    '(' + b.musicPct.toFixed(1) + '% muted; the first ~9s of any break is window fill plus confirmation)');
   const c = replayFixture('capture-bb28-steady-speech.json', 'right');
   t('capture 3: steady continuous speech is never muted', c.livePct === 0, '(' + c.livePct.toFixed(1) + '% muted)');
   const cL = replayFixture('capture-bb28-steady-speech.json', 'left');
   t('capture 3: the other channel too', cL.livePct === 0, '(' + cL.livePct.toFixed(1) + '% muted)');
+  const w1 = replayFixture('capture-bb28-whispering.json', 'right');
+  t('capture 4: quiet whispering is never muted', w1.livePct <= 1, '(' + w1.livePct.toFixed(1) + '% muted)');
+  const w2 = replayFixture('capture-bb28-whispering.json', 'left');
+  t('capture 4: the other channel too', w2.livePct <= 1, '(' + w2.livePct.toFixed(1) + '% muted)');
 } catch (e) {
   t('real-capture fixtures load', false, String(e.message));
 }
