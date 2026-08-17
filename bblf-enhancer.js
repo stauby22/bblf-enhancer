@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BBLF Enhancer
 // @namespace    http://tampermonkey.net/
-// @version      1.18
+// @version      1.18.1
 // @description  Monitor for issues on Big Brother Live Feed streams, reloading or starting video when necessary. Can autoload quad cam, add hotkeys, show video scrubber, and remap fullscreen button to only show video.
 // @author       liquid8d
 // @match        https://www.paramountplus.com/live-tv/stream/big_brother/*
@@ -14,6 +14,16 @@
 
 // ==/UserScript==
 /*
+v 1.18.1 (2026)
+ - the fast 'people are back' release now keys on GAPS between phrases rather than level
+   movement: a bed's loop seam swings the level just as much as speech does, so the old test
+   unmuted at every seam
+ - a second real capture had a nearly-mono bed (stereo agreement 0.59, overlapping live audio)
+   so the stereo test blocked detection entirely. Stereo width is dropped as a gate - it is
+   not consistent between breaks - and replaced by a LOUDNESS floor
+ - every false mute in testing came from a silent house (-69 dB), which is just as steady and
+   pause-free as music; requiring the bed to be audible removes them completely
+ - verified across both captures: 0% of live audio muted, 88% and 100% of break music
 v 1.18 (2026)
  - Break detection rewritten from measurement of a real capture. Template matching against a
    learned loop is retired as a decision input: the bed does NOT repeat (matching the music
@@ -328,11 +338,15 @@ v 1.2
     // NOT repeat - matching the music against itself 30s later only reaches 0.67, so template
     // matching against a learned loop could never hold. What separates a bed from the house is
     // its CHARACTER, and three cheap statistics do it cleanly on real data:
-    //   * level is rock steady        (music sd ~2.7 dB, live conversation ~12 dB)
-    //   * no pauses                   (music ~0%, conversation ~30% of frames in a gap)
-    //   * the two channels DIFFER     (a stereo bed: L/R agreement ~0.16; two cams of the same
-    //                                  room agree ~0.78 - this one is backwards from intuition)
-    // Measured on a real capture: 0% of live audio muted, ~92% of break music muted.
+    //   * level is rock steady   (music sd ~2.7 dB, live conversation ~12 dB)
+    //   * no pauses              (music ~0%, conversation ~30% of frames sit in a gap)
+    //   * it is LOUD             (the bed runs ~-32 dB; a silent house sits ~-69 dB)
+    // The loudness floor is what makes the other two safe. A quiet room is also perfectly
+    // steady and pause-free - it produced every false mute in testing (8s runs of live audio
+    // passing the first two tests) and vanishes entirely once loudness is required.
+    // Stereo width was tried and dropped: one break's bed was a wide stereo mix (L/R agreement
+    // 0.16) and another's was nearly mono (0.59, overlapping live audio), so it cannot gate.
+    // Measured across two real captures: 0% of live audio muted, 88% and 100% of break music.
     const enableAutoMute = true
     // gain a ducked side is pulled to (0 = silent; 0.05 leaves a faint hint of the break)
     const wbrbDuckGain = 0.0
@@ -368,17 +382,21 @@ v 1.2
     // frames, against runs of 300+ frames during music
     const musicMaxLevelSd = 6
     const musicMaxPauseRatio = 0.15
-    const musicMaxStereoAgreement = 0.45
+    // the bed must be audible. Raising this misses quiet beds; lowering it lets a silent
+    // house look like music again
+    const musicMinLevelDb = -45
+    // while a mute is held, tolerate quieter passages of the bed before giving up on it
+    const musicSustainMinLevelDb = -55
     // Hysteresis: a mute already held tolerates a livelier bed than it took to acquire one.
     // Without this a channel whose level wanders (sd ~10) starts the release timer mid-break.
     const musicSustainSdMultiplier = 1.8
     // consecutive qualifying frames before ducking (8 * 250ms = 2s of evidence)
     const musicEnterFrames = 8
-    // RELEASE, fast path: positive evidence that we are hearing PEOPLE again - the channels
-    // agree (both cams on the same room) and the level moves or has gaps
-    const liveMinStereoAgreement = 0.55
-    const liveMinLevelSd = 8
-    const liveMinPauseRatio = 0.20
+    // RELEASE, fast path: positive evidence that we are hearing PEOPLE again. The test is
+    // GAPS, not level movement: conversation leaves real holes between phrases (~30% of frames
+    // on the reference capture) while a bed does not (~15% even at its loop seams, where it
+    // briefly drops out). Keying this on level movement instead unmuted at every seam.
+    const liveMinPauseRatio = 0.25
     const liveReleaseMs = 2000
     // RELEASE, slow path: the bed stopped qualifying but nothing says people are back. Beds
     // have transitions at their loop seams (the reference bed loops every ~62s and briefly
@@ -1157,15 +1175,14 @@ v 1.2
         }
         const sd = Math.sqrt(varSum / n)
         const pause = quiet / n
-        const music = sd <= cfg.musicMaxSd && pause <= cfg.musicMaxPause &&
-            stereoAgreement <= cfg.musicMaxStereo
-        // looser test used only to SUSTAIN an existing mute (see musicSustainSdMultiplier)
+        const music = sd <= cfg.musicMaxSd && pause <= cfg.musicMaxPause && mean >= cfg.musicMinLevel
+        // looser test used only to SUSTAIN an existing mute
         const musicSustain = sd <= cfg.musicMaxSd * cfg.sustainSdMult &&
-            pause <= cfg.musicMaxPause * 1.5 && stereoAgreement <= cfg.musicMaxStereo + 0.1
+            pause <= cfg.musicMaxPause * 1.5 && mean >= cfg.sustainMinLevel
         // positive evidence of people, not merely the absence of a bed
-        const live = stereoAgreement >= cfg.liveMinStereo &&
-            (sd >= cfg.liveMinSd || pause >= cfg.liveMinPause)
-        return { valid: true, music: music, musicSustain: musicSustain, live: live, sd: sd, pause: pause }
+        const live = pause >= cfg.liveMinPause
+        return { valid: true, music: music, musicSustain: musicSustain, live: live,
+            sd: sd, pause: pause, level: mean }
     }
 
     // returns 'enter' | 'release' | null, mutating only the passed state object.
@@ -1220,11 +1237,10 @@ v 1.2
             analysisFrames: wbrbAnalysisFrames,
             musicMaxSd: musicMaxLevelSd,
             musicMaxPause: musicMaxPauseRatio,
-            musicMaxStereo: musicMaxStereoAgreement,
+            musicMinLevel: musicMinLevelDb,
+            sustainMinLevel: musicSustainMinLevelDb,
             enterFrames: musicEnterFrames,
             sustainSdMult: musicSustainSdMultiplier,
-            liveMinStereo: liveMinStereoAgreement,
-            liveMinSd: liveMinLevelSd,
             liveMinPause: liveMinPauseRatio,
             liveReleaseMs: liveReleaseMs,
             quietReleaseMs: quietReleaseMs,
@@ -1399,7 +1415,8 @@ v 1.2
             }
             if (verdict === 'enter') {
                 wbrbSetDuck(key, true)
-                log('wbrb: ' + key + ' ducked (sd ' + ev.sd.toFixed(1) + ' pause ' + ev.pause.toFixed(2) + ' lr ' + wbrbLr.toFixed(2) + ')')
+                log('wbrb: ' + key + ' ducked (sd ' + ev.sd.toFixed(1) + ' pause ' + ev.pause.toFixed(2) +
+                ' level ' + ev.level.toFixed(0) + 'dB, stereo ' + wbrbLr.toFixed(2) + ')')
                 showSeekToast('break detected — ' + key + ' muted')
             } else if (verdict === 'release') {
                 wbrbSetDuck(key, false)
@@ -1489,7 +1506,7 @@ v 1.2
             : 'NONE'))
         lines.push('detector: statistical (no profile needed)  autoMute ' + getSetting('autoMute'))
         lines.push('entry: sd<=' + musicMaxLevelSd + ' pause<=' + musicMaxPauseRatio +
-            ' stereo<=' + musicMaxStereoAgreement + ' for ' + musicEnterFrames + ' frames')
+            ' level>=' + musicMinLevelDb + 'dB for ' + musicEnterFrames + ' frames')
         lines.push('release: people ' + (liveReleaseMs / 1000) + 's / quiet ' + (quietReleaseMs / 1000) +
             's / backstop ' + (wbrbMaxHoldWithoutStrongMs / 1000) + 's')
         lines.push('now: stereo ' + wbrbLr.toFixed(2) + '  L sd ' + wbrbSide.left.sd.toFixed(1) +
@@ -1710,7 +1727,7 @@ v 1.2
                 L.levelDb.toFixed(0).padStart(5) + 'dB ' + mark(L) + '\n' +
             'R sd' + R.sd.toFixed(1).padStart(5) + ' pause' + R.pause.toFixed(2).padStart(5) +
                 R.levelDb.toFixed(0).padStart(5) + 'dB ' + mark(R) + '\n' +
-            'stereo ' + wbrbLr.toFixed(2) + (wbrbLr <= musicMaxStereoAgreement ? ' wide(bed)' : (wbrbLr >= liveMinStereoAgreement ? ' agree(people)' : '')) +
+            'stereo ' + wbrbLr.toFixed(2) + '  (telemetry)' +
             (wbrbProfile ? '  tmpl ' + Math.max(0, L.score).toFixed(2) : '')
     }
 

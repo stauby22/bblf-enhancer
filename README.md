@@ -20,10 +20,10 @@ A Tampermonkey userscript that turns the **Big Brother US live feeds on Paramoun
   - **Settings** — refresh rate, quality, theater mode, and UI toggles, persisted in localStorage so they survive script updates
 - **Theater mode**: locks page scrolling and hides Paramount's chrome (slide-in header, footer, hover gradients, their LIVE badge)
 - **Automatic break muting** — no setup required: production's "we'll be right back" bed is
-  recognised by its *character* rather than by matching a recording. A bed holds a rock-steady
-  level, never pauses, and is a wide stereo mix; house conversation swings in level, has gaps,
-  and reads nearly identical on both channels. Measured against a real capture: 0% of live
-  conversation muted, ~93% of the break muted. Ducking is per channel, since a break can take
+  recognised by its *character* rather than by matching a recording: a bed holds a rock-steady
+  level, never pauses, and is audibly loud, while house conversation swings in level and leaves
+  real gaps between phrases. Measured against two real captures: 0% of live conversation muted,
+  99% and 77% of the breaks muted. Ducking is per channel, since a break can take
   one cam while the other stays live
 - **Speech leveling** (gated upward compression — 2am HOH whispering comes up, silence doesn't get
   pumped) and **channel balance auto-trim**, both bounded and both frozen while a side is muted
