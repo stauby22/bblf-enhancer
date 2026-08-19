@@ -15,7 +15,7 @@ A Tampermonkey userscript that turns the **Big Brother US live feeds on Paramoun
 - **Transport bar** (Apple Music-style): skip ±30s / ±5min within the buffer, pause that *sticks*, jump-to-live pill showing how far behind you are, picture-in-picture, mute, fullscreen
 - **Feed status via [FeedBot](https://feedbot.liquid8d.dev/)**: live dot + "up · 2h 14m" / "fish · 3m" / "down · 12m", with recent state changes and the typical outage schedule in the tooltip
 - **Sidebar panel** (`r` to toggle; pushes the video over, never covers quad view):
-  - **Feed** — live reader for the current r/BigBrother *Feed Discussion* thread: auto-discovers the morning/afternoon/evening/late-night thread by flair, polls comments (rate configurable), preserves your scroll position, "N new" pill
+  - **Feed** — live reader for the current r/BigBrother *Feed Discussion* thread: auto-discovers the morning/afternoon/evening/late-night thread by flair, polls comments (rate configurable), preserves your scroll position, "N new" pill, and each comment's timestamp is a permalink that opens it on reddit
   - **House** — cast wall with portraits and badges (👑 HOH, NOM, V·POV, SAVED, HAVE-NOT, BBB, OUT), auto-parsed from the mod sticky in the discussion thread; evictions are remembered in localStorage for the rest of the season
   - **Settings** — refresh rate, quality, theater mode, and UI toggles, persisted in localStorage so they survive script updates
 - **Theater mode**: locks page scrolling and hides Paramount's chrome (slide-in header, footer, hover gradients, their LIVE badge)

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BBLF Enhancer
 // @namespace    http://tampermonkey.net/
-// @version      1.19
+// @version      1.20
 // @description  Monitor for issues on Big Brother Live Feed streams, reloading or starting video when necessary. Can autoload quad cam, add hotkeys, show video scrubber, and remap fullscreen button to only show video.
 // @author       liquid8d
 // @match        https://www.paramountplus.com/live-tv/stream/big_brother/*
@@ -14,6 +14,9 @@
 
 // ==/UserScript==
 /*
+v 1.20 (2026)
+ - Feed tab permalinks: a comment's timestamp opens that comment on reddit (with context), and
+   the thread title opens the thread. Both in a new tab, so the feed keeps playing
 v 1.19 (2026)
  - FIX for quiet whispering being muted. Whispering is as steady (sd 2.6-3.5) and as loud
    (-37 dB) as the break bed, so no level threshold can separate them - confirmed by testing
@@ -923,7 +926,10 @@ v 1.2
             '.bblf-comment { padding:12px 16px; border-bottom:0.5px solid rgba(255,255,255,0.07); }',
             '.bblf-c-meta { display:flex; align-items:center; gap:7px; margin-bottom:5px; }',
             '.bblf-c-user { font-size:13px; font-weight:600; color:#30d158; }',
-            '.bblf-c-time { font-size:12px; color:rgba(235,235,245,0.4); }',
+            '.bblf-c-time { font-size:12px; color:rgba(235,235,245,0.4); text-decoration:none; }',
+            'a.bblf-c-time:hover { color:#30d158; text-decoration:underline; }',
+            '#bblf-panel-title { text-decoration:none; }',
+            '#bblf-panel-title:hover { color:#30d158; }',
             '.bblf-c-score { margin-left:auto; font-size:12px; color:rgba(235,235,245,0.5); letter-spacing:0.2px; }',
             '.bblf-c-body { font-size:13.5px; line-height:1.42; color:rgba(255,255,255,0.86); white-space:pre-wrap; word-wrap:break-word; }',
             '#bblf-reddit-pill { position:absolute; top:92px; left:50%; transform:translateX(-50%); display:none; align-items:center; gap:5px;',
@@ -2347,8 +2353,10 @@ v 1.2
         head.style.cssText = 'padding:10px 16px 11px;border-top:0.5px solid rgba(255,255,255,0.08);border-bottom:0.5px solid rgba(255,255,255,0.08);'
         const headRow = document.createElement('div')
         headRow.style.cssText = 'display:flex;align-items:center;gap:10px;'
-        const title = document.createElement('div')
+        const title = document.createElement('a')
         title.id = 'bblf-panel-title'
+        title.target = '_blank'
+        title.rel = 'noopener noreferrer'
         title.textContent = 'r/' + redditSub
         title.style.cssText = 'font-size:15px;font-weight:600;color:#fff;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex:1;letter-spacing:-0.2px;'
         const refreshBtn = document.createElement('button')
@@ -2514,7 +2522,8 @@ v 1.2
             const titleEl = document.getElementById('bblf-panel-title')
             if (titleEl) {
                 titleEl.textContent = t.title
-                titleEl.title = t.title
+                titleEl.title = t.title + '\nopen the thread on reddit'
+                titleEl.href = 'https://www.reddit.com' + t.permalink
             }
             log('reddit thread: ' + t.title)
         }
@@ -2564,6 +2573,15 @@ v 1.2
         }
     }
 
+    // Reddit gives each comment its own permalink; fall back to composing one from the thread
+    // if a payload ever lacks it. context=3 opens the comment with a few parents above it,
+    // which is usually what you want when a remark only makes sense as a reply.
+    function redditCommentUrl(c) {
+        if (c.permalink) return 'https://www.reddit.com' + c.permalink + '?context=3'
+        if (redditThread) return 'https://www.reddit.com' + redditThread.permalink + c.id + '/?context=3'
+        return null
+    }
+
     function renderComment(c) {
         // textContent everywhere: comment bodies are untrusted and must never become HTML
         const el = document.createElement('div')
@@ -2573,9 +2591,19 @@ v 1.2
         const user = document.createElement('span')
         user.className = 'bblf-c-user'
         user.textContent = 'u/' + c.author
-        const time = document.createElement('span')
+        const url = redditCommentUrl(c)
+        const time = document.createElement(url ? 'a' : 'span')
         time.className = 'bblf-c-time'
         time.textContent = timeAgo(c.created_utc)
+        if (url) {
+            time.href = url
+            time.target = '_blank'
+            time.rel = 'noopener noreferrer'
+            time.title = 'open this comment on reddit'
+            // the panel lives inside the player; let the click through to the browser without
+            // the page's own handlers seeing it
+            time.onclick = function(e) { e.stopPropagation() }
+        }
         const score = document.createElement('span')
         score.className = 'bblf-c-score'
         score.textContent = (typeof c.score === 'number') ? '▲ ' + c.score : ''
